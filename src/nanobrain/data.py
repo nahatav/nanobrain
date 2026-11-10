@@ -117,6 +117,97 @@ class InfiniteSampler(Sampler[int]):
                 index += 1
 
 
+class SpacingBucketBatchSampler(Sampler[list[int]]):
+    """Batches of `batch_size` images drawn from `base`'s index stream (an InfiniteSampler built
+    with start 0 and world_size 1, weights and anneal switch included), regrouped so that images of
+    one native voxel spacing share a batch. Each pool of `pool` consecutive batches (pool *
+    batch_size consecutive indices of the stream) is stably sorted by spacing key, cut into batches
+    and the batch order shuffled. So every window of `pool` batches holds exactly the images the
+    unbucketed loader would draw in it (same per-epoch distribution, same images per step on
+    average); only which of those images share a batch changes. forward_native runs one eager
+    tokenize / embed / head pass per spacing group, so fewer groups per batch means fewer launches.
+    The stable sort keeps the stream's random order inside a spacing, so the RTD partner (next image
+    of the group) stays a random draw. Resume: `start` counts global batches (start_step *
+    accum_iter * world_size); the stream is replayed from the seed and the batches before it are
+    skipped. With ddp rank r takes global batches r, r + world_size, ..."""
+
+    def __init__(
+        self,
+        base: Sampler[int],
+        keys: list[int],
+        batch_size: int,
+        pool: int = 32,
+        seed: int = 0,
+        start: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        assert pool >= 1 and batch_size >= 1
+        self.base = base
+        self.keys = keys
+        self.batch_size = batch_size
+        self.pool = pool
+        self.seed = seed
+        self.start = start
+        self.rank = rank
+        self.world_size = world_size
+
+    def __len__(self) -> int:
+        # endless; DataLoader only asks when someone calls len(loader)
+        return 2**62
+
+    def __iter__(self):
+        # own generator for the batch order, so the index stream is the base sampler's, bitwise
+        generator = torch.Generator().manual_seed(self.seed + 2)
+        size = self.batch_size * self.pool
+        stream = iter(self.base)
+        batch_index = 0
+        while True:
+            chunk = [next(stream) for _ in range(size)]
+            # stable: equal keys keep their (random) stream order
+            chunk.sort(key=lambda ii: self.keys[ii])
+            batches = [chunk[jj * self.batch_size : (jj + 1) * self.batch_size] for jj in range(self.pool)]
+            for jj in torch.randperm(self.pool, generator=generator).tolist():
+                if batch_index >= self.start and batch_index % self.world_size == self.rank:
+                    yield batches[jj]
+                batch_index += 1
+
+
+def ras_spacing(spacing, orientation: str | None) -> tuple[float, float, float]:
+    # images.parquet spacing is per stored axis; reorient_to_ras permutes the axes to R, A, S
+    spacing = [float(sp) for sp in spacing]
+    if not orientation or orientation == "RAS":
+        return tuple(spacing)
+    axis_of = {"R": 0, "L": 0, "A": 1, "P": 1, "S": 2, "I": 2}
+    order = np.argsort([axis_of[code] for code in orientation]).tolist()
+    return tuple(spacing[ii] for ii in order)
+
+
+def snap_spacing(spacing, target_spacing: float = 1.0) -> tuple[float, float, float]:
+    # native_spacing's rounding, so the keys match forward_native's spacing groups
+    return tuple(
+        target_spacing if abs(sp - target_spacing) < 1e-3 else round(float(sp), 4) for sp in spacing
+    )
+
+
+def spacing_keys(
+    paths: list[str], images_parquet: str | Path, target_spacing: float = 1.0
+) -> tuple[list[int], list[tuple[float, float, float]]]:
+    """Integer spacing key per dataset index (same key = same forward_native spacing group, up to
+    header rounding), from images.parquet (no image reads). Returns (keys, spacing per key)."""
+    table = pd.read_parquet(images_parquet, columns=["path", "orientation", "spacing"])
+    key = "derivatives/" + table["path"].str.removeprefix("source/").str.removesuffix(".nii.gz") + ".npz"
+    table = table.set_index(key).reindex(paths)
+    missing = int(table["spacing"].isna().sum())
+    assert missing == 0, f"spacing_keys: {missing} filelist paths not in images.parquet"
+    ids: dict[tuple, int] = {}
+    keys = []
+    for spacing, orientation in zip(table["spacing"], table["orientation"]):
+        sp = snap_spacing(ras_spacing(spacing, orientation), target_spacing)
+        keys.append(ids.setdefault(sp, len(ids)))
+    return keys, list(ids)
+
+
 def brle_to_dense(mask_rle: torch.Tensor, shape: tuple[int, int, int]) -> torch.Tensor:
     # mask_rle is a binary run length encoding, alternating false and true runs starting
     # with false
