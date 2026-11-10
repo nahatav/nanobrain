@@ -19,7 +19,10 @@ import wandb
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
-from torch.nn.attention import activate_flash_attention_impl, current_flash_attention_impl
+try:
+    from torch.nn.attention import activate_flash_attention_impl, current_flash_attention_impl
+except ImportError:  # older torch: no pluggable flash impl, sdpa only
+    activate_flash_attention_impl = current_flash_attention_impl = None
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
@@ -114,12 +117,7 @@ def main(args: DictConfig):
     # the example plots assume the 1 mm grid
     assert not (args.native and args.plot_period), "set plot_period 0 with native"
 
-    if args.flash_attention_impl:
-        # e.g. FA3 (flash-attn-3), with sdpa's cudnn / mem efficient backends off so flash runs
-        activate_flash_attention_impl(args.flash_attention_impl)
-        torch.backends.cuda.enable_cudnn_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-        logger.info(f"flash attention impl: {current_flash_attention_impl()}")
+    setup_attention(args, device)
 
     fino_meta = None
     if args.get("fino3d") and args.fino3d.enabled:
@@ -604,6 +602,52 @@ def make_optimizer(args: DictConfig, model: nn.Module):
             Muon(muon_groups, momentum=args.muon_momentum, fused=args.muon_fused),
         ]
     )
+
+
+SDPA_BACKENDS = {
+    "flash": torch.backends.cuda.enable_flash_sdp,
+    "cudnn": torch.backends.cuda.enable_cudnn_sdp,
+    "efficient": torch.backends.cuda.enable_mem_efficient_sdp,
+    "math": torch.backends.cuda.enable_math_sdp,
+}
+
+
+def setup_attention(args: DictConfig, device: torch.device) -> str:
+    # flash_attention_impl (e.g. FA3 = flash-attn-3 behind sdpa) with sdpa's cudnn / mem efficient
+    # backends off so flash runs: the H100 path, unchanged. FA3 is Hopper (sm_90) only, so on any
+    # other gpu (G4 Blackwell sm_120, A100 sm_80) or without the package the run falls back to
+    # torch's own sdpa kernels (same attention math, different kernel) unless
+    # flash_attention_fallback is false. sdpa_backends (null = torch's choice) restricts the
+    # fallback to a subset of flash / cudnn / efficient / math. Returns the attention path used
+    impl = args.get("flash_attention_impl")
+    if impl and device.type == "cuda":
+        cap = torch.cuda.get_device_capability(device)
+        reason = None
+        if activate_flash_attention_impl is None:
+            reason = "this torch has no activate_flash_attention_impl"
+        elif str(impl).upper() == "FA3" and cap != (9, 0):
+            reason = f"FA3 needs sm_90, this gpu is sm_{cap[0]}{cap[1]}"
+        else:
+            try:
+                activate_flash_attention_impl(impl)
+            except Exception as e:  # noqa: BLE001
+                reason = f"{type(e).__name__}: {e}"
+        if reason is None:
+            torch.backends.cuda.enable_cudnn_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            logger.info(f"flash attention impl: {current_flash_attention_impl()}")
+            return str(impl)
+        if not args.get("flash_attention_fallback", True):
+            raise RuntimeError(f"flash_attention_impl {impl} unavailable: {reason}")
+        logger.warning(f"flash_attention_impl {impl} unavailable ({reason}); using torch sdpa")
+    backends = args.get("sdpa_backends")
+    if backends and device.type == "cuda":
+        unknown = set(backends) - set(SDPA_BACKENDS)
+        assert not unknown, f"sdpa_backends: unknown {sorted(unknown)}, use {sorted(SDPA_BACKENDS)}"
+        for name, enable in SDPA_BACKENDS.items():
+            enable(name in backends)
+    logger.info(f"attention: torch sdpa, backends {list(backends) if backends else 'torch default'}")
+    return "sdpa"
 
 
 def ignore_sigterm(worker_id: int):
