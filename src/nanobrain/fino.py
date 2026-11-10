@@ -6,8 +6,11 @@
 # (FINO's sigmoid ramp). A negative sign is gradient reversal (invariance). The heads are training
 # only: the eval rebuilds them from the checkpoint args and never calls them.
 #
-# Contamination gate (scratchpad fino/contamination.md): PT030_OpenNeuro/ds001510 shares subjects
-# with OpenBHB, so every target is masked on exclude_collections.
+# Contamination gate (scratchpad fino/contamination.md; FOMO300K vs OpenBHB audit 2026-11-10): PT030_OpenNeuro/
+# ds001510, ds001554 (Hasson-lab precursors of Narratives = OpenBHB NAR) and ds003974 (Reading Brain
+# L1 = OpenBHB RBP, whose FOMO rows carry age) share subjects with OpenBHB, so every target is masked
+# on exclude_collections (default_pretrain.yaml lists all three). The images themselves stay in the
+# MAE stream if the filelist has them; the L2 / L4 filelists do not.
 import logging
 import math
 from pathlib import Path

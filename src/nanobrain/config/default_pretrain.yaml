@@ -136,8 +136,8 @@ debug: false
 # encoder tokens), port of nanopath's FINO. Per target the value is its backbone gradient
 # multiplier (sign; 0 = head off), times gamma ramped 0 -> gamma_max over training; each term's loss
 # weight is `weight`. FINO defaults: continuous x3, discrete x1, gamma_max 0.7, weight 0.03.
-# exclude_collections masks every target there (contamination gate: ds001510 shares subjects
-# with OpenBHB). enabled false = the base run, bitwise
+# exclude_collections masks every target there (contamination gate: ds001510, ds001554 and ds003974
+# share subjects with OpenBHB). enabled false = the base run, bitwise
 fino3d:
   enabled: false
   weight: 0.03
@@ -154,7 +154,9 @@ fino3d:
   brain_volume: 0.0
   # group classes with fewer images (in the train filelist) are masked
   group_min_count: 300
-  exclude_collections: [PT030_OpenNeuro/ds001510]
+  # OpenBHB subject overlaps (FOMO300K vs OpenBHB audit, 2026-11-10): ds003974 = OpenBHB RBP (and has FOMO age),
+  # ds001510 / ds001554 = Hasson-lab precursors of Narratives (OpenBHB NAR)
+  exclude_collections: [PT030_OpenNeuro/ds001510, PT030_OpenNeuro/ds001554, PT030_OpenNeuro/ds003974]
   # filled at train time from the train filelist, kept in the checkpoint args
   group_classes: null
   age_mean: null
