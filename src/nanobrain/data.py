@@ -152,10 +152,6 @@ class SpacingBucketBatchSampler(Sampler[list[int]]):
         self.rank = rank
         self.world_size = world_size
 
-    def __len__(self) -> int:
-        # endless; DataLoader only asks when someone calls len(loader)
-        return 2**62
-
     def __iter__(self):
         # own generator for the batch order, so the index stream is the base sampler's, bitwise
         generator = torch.Generator().manual_seed(self.seed + 2)
