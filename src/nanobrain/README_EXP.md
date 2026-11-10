@@ -15,19 +15,25 @@ plus any bare `key=value` token, so this works:
 bash /content/run_experiment.sh NAME --config src/nanobrain/config/g4_base.yaml key=value ...
 ```
 
-Before the first run on a runtime (the branches must be on the fork first):
+Before the first run on a runtime (fetch the branch from the fork or from the uploaded bundle):
 
 ```
 cd /content/nanobrain && git fetch origin exp/base && git checkout exp/base && uv sync
-bash /content/fetch_data.sh /content/nanobrain/src/nanobrain/config/L2_qc_rand138.txt   # 137.8 GB
+bash /content/fetch_data.sh /content/L2.txt   # 137.8 GB
 # L4 is another 137.6 GB; L2 and L4 together are 245 GB (16.1K images shared)
 ```
+
+The runtime filelists are `/content/L2.txt` and `/content/L4.txt` (copies of `config/L2_qc_rand138.txt`
+and `config/L4_evalmatch138.txt`). Every command below passes `train_filelist=` with the absolute
+path, so a run never depends on the copy inside the repo. The filelist only picks the images:
+`total_steps`, `warmup_frac` and `decay_frac` fix the schedule whatever the list length.
 
 Quick smoke test without the eval (about 2 minutes plus compile):
 
 ```
 cd /content/nanobrain && uv run --no-sync python -m nanobrain.train --config src/nanobrain/config/g4_base.yaml \
-    output_dir=output name=smoke-NAME total_steps=300 print_freq=20 checkpoint_period=100000000
+    train_filelist=/content/L2.txt output_dir=output name=smoke-NAME total_steps=300 print_freq=20 \
+    checkpoint_period=100000000
 ```
 
 ## exp/base
@@ -51,7 +57,8 @@ FINO's gamma ramp follows `step / total_steps` instead of the wall clock (the sa
 steady step rate).
 
 ```
-bash /content/run_experiment.sh g4base-L2-s7338 --config src/nanobrain/config/g4_base.yaml
+bash /content/run_experiment.sh g4base-L2-s7338 --config src/nanobrain/config/g4_base.yaml \
+    train_filelist=/content/L2.txt
 bash /content/run_experiment.sh g4base-L4-s7338 --config src/nanobrain/config/g4_base.yaml \
-    train_filelist=src/nanobrain/config/L4_evalmatch138.txt
+    train_filelist=/content/L4.txt
 ```
