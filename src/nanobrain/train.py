@@ -191,6 +191,26 @@ def main(args: DictConfig):
         args.decay_steps = round(args.decay_epochs * steps_per_epoch)
         logger.info(f"{args.epochs} epochs of {steps_per_epoch:.1f} steps")
 
+    if args.get("warmup_frac") is not None or args.get("decay_frac") is not None:
+        # step keyed fractions of total_steps: warmup over the first warmup_frac, linear decay to
+        # min_lr over the last decay_frac (null = keep warmup_steps / decay_steps). total_steps is
+        # exactly what the config sets, whatever the filelist size, so a run off the H100 (time_limit
+        # null, total_steps = the H100 hour's step count) gets the schedule shape of that hour
+        assert not args.get("time_schedule"), "warmup_frac / decay_frac are step keyed: time_schedule false"
+        assert not args.epochs, (
+            "warmup_frac / decay_frac: set epochs null (epochs re-derives total_steps from the filelist size)"
+        )
+        if args.get("warmup_frac") is not None:
+            args.warmup_steps = round(args.warmup_frac * args.total_steps)
+        if args.get("decay_frac") is not None:
+            args.decay_steps = round(args.decay_frac * args.total_steps)
+        assert args.warmup_steps + args.decay_steps <= args.total_steps, "warmup + decay > total_steps"
+        logger.info(
+            f"step keyed schedule: {args.total_steps} steps = "
+            f"{args.total_steps * args.batch_size * world_size * args.accum_iter / len(dataset):.2f} "
+            f"epochs of {len(dataset)} images"
+        )
+
     if args.get("time_schedule"):
         # wall-clock keyed schedule: warmup over warmup_steps, constant, then a linear decay to
         # min_lr over the last time_decay_frac of the training time, ending at time_limit. the
