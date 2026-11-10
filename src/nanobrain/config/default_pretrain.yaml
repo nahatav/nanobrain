@@ -67,6 +67,11 @@ decay_epochs: 0
 # training time and stop at time_limit; total_steps / decay_steps are ignored
 time_schedule: false
 time_decay_frac: 0.2
+# step keyed schedule as fractions of total_steps (null = use warmup_steps / decay_steps): warmup
+# over the first warmup_frac, linear decay to min_lr over the last decay_frac. needs epochs null and
+# time_schedule false. time_schedule with time_decay_frac f on a steady step rate ~ decay_frac f
+warmup_frac: null
+decay_frac: null
 weight_decay: 0.05
 betas: [0.9, 0.95]
 clip_grad: 1.0
