@@ -408,6 +408,18 @@ def train(
     log_path = output_dir / "log.json"
     # time limit on wall time from the start of main, summed over restarts
     time_limit = args.time_limit * 60 if args.time_limit else float("inf")
+    # H100 guard: the leaderboard budget is 1 h on one H100. A step-keyed run (total_steps matched to
+    # an H100 hour from off-H100 timing) also stops at h100_time_limit minutes when it runs on an H100,
+    # so a maintainer rerun cannot exceed the budget even if the step estimate was optimistic
+    h100_time_limit = args.get("h100_time_limit")
+    if h100_time_limit and device.type == "cuda" and "H100" in torch.cuda.get_device_name(device):
+        time_limit = min(time_limit, h100_time_limit * 60)
+        logger.info(f"H100 guard: training stops at {h100_time_limit} min wall time")
+    # full-context cooldown: the last ctx_cooldown.frac of training sees ctx_cooldown.num_visible
+    # visible tokens, closer to the ~3500 tokens per image the eval encodes
+    ctx_cooldown = args.get("ctx_cooldown") or {}
+    cooldown_frac = float(ctx_cooldown.get("frac") or 0.0)
+    cooldown_logged = False
     step = start_step
     done = False
     time_schedule = bool(args.get("time_schedule"))
@@ -476,11 +488,23 @@ def train(
                 "fino_meta": batch["fino"],
                 "fino_gamma": fino_ramp(args.fino3d.gamma_max, progress),
             }
+        num_visible = args.num_visible
+        if cooldown_frac:
+            if time_schedule:
+                wall = prev_wall_time + time.monotonic() - start_time
+                cool_progress = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
+            else:
+                cool_progress = step / total_steps
+            if cool_progress >= 1.0 - cooldown_frac:
+                num_visible = int(ctx_cooldown["num_visible"])
+                if not cooldown_logged:
+                    logger.info(f"ctx cooldown: num_visible {args.num_visible} -> {num_visible} at step {step}")
+                    cooldown_logged = True
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
                 images,
                 masks,
-                num_visible=args.num_visible,
+                num_visible=num_visible,
                 num_predict=args.num_predict,
                 num_samples=args.num_samples,
                 with_state=False,
