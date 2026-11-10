@@ -4,7 +4,8 @@
 # norm of a 2D ViT-B (width 768, 12 heads) copy over as is. The 2D patch embedding inflates
 # I3D-style into the 1 mm canonical NativeEmbed kernel. Position embeddings stay random.
 #
-# Supported checkpoints (local safetensors, compute nodes have no network):
+# Supported checkpoints (local safetensors, compute nodes have no network; when natinit.path is
+# missing, model.safetensors of natinit.hf_repo is downloaded through huggingface_hub instead):
 #   mae:    facebook/vit-mae-base (HF ViTMAEForPreTraining, separate q/k/v)
 #   dinov2: timm/vit_base_patch14_dinov2.lvd142m (fused qkv, LayerScale folded into proj / fc2)
 
@@ -85,11 +86,32 @@ def inflate_patch_kernel(w2: torch.Tensor, p: int) -> torch.Tensor:
     return w.reshape(D, p * p * p).contiguous()
 
 
+def resolve_checkpoint(cfg) -> Path:
+    """cfg.path if it exists (local safetensors file or dir), else model.safetensors of cfg.hf_repo
+    at cfg.hf_revision, downloaded once through huggingface_hub into cfg.cache_dir (null = the HF
+    cache). For runtimes with network (Colab); the cluster path is used as is."""
+    path = Path(cfg.path) if cfg.get("path") else None
+    if path is not None and path.exists():
+        return path / "model.safetensors" if path.is_dir() else path
+    repo = cfg.get("hf_repo")
+    assert repo, f"natinit: {path} not found and no hf_repo to download"
+    from huggingface_hub import hf_hub_download
+
+    local = hf_hub_download(
+        repo_id=repo,
+        filename="model.safetensors",
+        revision=cfg.get("hf_revision"),
+        cache_dir=cfg.get("cache_dir"),
+    )
+    logger.info(f"natinit: {path} not found, using {repo}@{cfg.get('hf_revision')} -> {local}")
+    return Path(local)
+
+
 @torch.no_grad()
 def apply_natural_init(model, cfg) -> dict:
     """Copy blocks + final norm (and with cfg.embed the inflated patch embedding) into model."""
-    path = Path(cfg.path)
-    sd = load_file(str(path / "model.safetensors") if path.is_dir() else str(path))
+    path = resolve_checkpoint(cfg)
+    sd = load_file(str(path))
     family = _family(sd)
     report = {"family": family, "path": str(path), "copied": [], "mismatch": [], "skipped": []}
 
