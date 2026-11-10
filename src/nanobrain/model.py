@@ -828,7 +828,12 @@ class ViTMAE3D(nn.Module):
                 pos = labels > 0.5
                 acc_pos = ((logits > 0) & pos).sum() / pos.sum().clamp_min(1)
                 acc_neg = ((logits <= 0) & ~pos).sum() / (~pos).sum().clamp_min(1)
-            self.rtd_stats = {"rtd_loss": rtd_loss.detach(), "rtd_tpr": acc_pos, "rtd_tnr": acc_neg}
+            # rtd_pos: share of visible tokens replaced (only spacing groups of >= 2 images swap, so
+            # it tracks the batch composition: ~9% random bs 32, ~14% spacing bucketed)
+            self.rtd_stats = {
+                "rtd_loss": rtd_loss.detach(), "rtd_tpr": acc_pos, "rtd_tnr": acc_neg,
+                "rtd_pos": pos.float().mean(),
+            }
             self.fino_stats = {**self.fino_stats, **self.rtd_stats}
 
         if not with_state:

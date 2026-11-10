@@ -1,0 +1,146 @@
+name: best2_speed
+notes: 'best2 + throughput package (exp/speed): batch_size 16 x num_samples 4 (same 64
+  sequences per step, same lr), spacing bucketed batches in pools of 32 batches, Inductor compile
+  cache. Same recipe otherwise. total_steps is still best2''s 22,800 until the Colab benchmark
+  (lit/R8_speed_impl.md) predicts the H100 step count; h100_time_limit 59.5 caps any H100 rerun.'
+output_dir: output
+train_filelist: /content/L4.txt
+anneal_filelist: null
+num_workers: 12
+prefetch_factor: 4
+prep_threads: 3
+prep_lean: false
+clip_quantiles:
+- 0.005
+- 0.995
+grid_size:
+- 192
+- 240
+- 192
+target_spacing: 1.0
+patch_size: 8
+native: true
+num_visible: 512
+num_predict: 768
+num_samples: 4
+model_kwargs:
+  depth: 12
+  embed_dim: 768
+  num_heads: 12
+  decoder_depth: 6
+  decoder_embed_dim: 512
+  decoder_num_heads: 8
+  class_tokens: 0
+  drop_path_rate: 0.0
+  min_mask_frac: 0.05
+  level_weight: 0.5
+  level_mirror:
+  - 1.0
+  - 1.5
+  - 2.0
+  level_mirror_margin: 0.5
+  rtd_weight: 0.1
+  rtd_ratio: 0.15
+  rtd_quantiles: 32
+batch_size: 16
+accum_iter: 1
+base_lr: 0.002
+lr: null
+min_lr: 1.0e-06
+time_limit: null
+total_steps: 22800
+warmup_steps: 0
+decay_steps: 0
+epochs: null
+warmup_epochs: 0
+decay_epochs: 0
+time_schedule: false
+time_decay_frac: 0.2
+warmup_frac: 0.08
+decay_frac: 0.2
+weight_decay: 0.05
+betas:
+- 0.9
+- 0.95
+clip_grad: 1.0
+fused_adamw: true
+optimizer: muon
+muon_lr_mult: 2
+muon_momentum: 0.95
+muon_encoder_only: false
+muon_decoder_only: false
+muon_all_matrices: false
+muon_fused: true
+amp: true
+amp_dtype: bfloat16
+compile: true
+gc_freeze: true
+cudagraphs: false
+fast_startup: true
+high_priority_stream: true
+decoder_prune_last: true
+flash_attention_impl: FA3
+flash_attention_fallback: true
+sdpa_backends:
+- flash
+- cudnn
+- efficient
+ckpt: null
+resume: false
+auto_resume: true
+checkpoint_period: 2500
+checkpoint_steps: null
+print_freq: 100
+plot_period: 0
+plot_nrow: 4
+plot_ncol: 2
+plot_num_predict: null
+device: cuda
+distributed: false
+seed: 7338
+debug: false
+fino3d:
+  enabled: true
+  weight: 0.03
+  gamma_max: 0.7
+  hidden: 256
+  age: 3.0
+  sex: 0
+  group: 0
+  field_strength: 0.0
+  manufacturer: 0.0
+  nuisance_mode: predict
+  brain_volume: 0.0
+  group_min_count: 300
+  exclude_collections:
+  - PT030_OpenNeuro/ds001510
+  - PT030_OpenNeuro/ds001554
+  - PT030_OpenNeuro/ds003974
+  group_classes: null
+  age_mean: null
+  age_std: null
+  bv_mean: null
+  bv_std: null
+natinit:
+  enabled: true
+  path: null
+  embed: true
+  block_lr_mult: 0.3
+  layer_decay: 1.0
+  pos_scale: 1.0
+wandb: false
+wandb_entity: null
+wandb_project: nanobrain-climb
+ctx_cooldown:
+  frac: 0.1
+  num_visible: 1280
+h100_time_limit: 59.5
+subject_temper: 0.5
+# throughput options (exp/speed). spacing_bucket K: each window of K batches is regrouped by native
+# voxel spacing (same images per window, ~4 spacing groups per batch instead of ~10 at bs 16 on L4).
+# 0 = off (the plain shuffled loader)
+spacing_bucket: 32
+# Inductor mega-cache: loaded before compile if the file exists, written after training if not
+compile_cache: /content/nanobrain_compile_cache.bin
+# fwd + bwd flops per batch from an earlier run's log (skips the startup FlopCounterMode pass); null = count
+batch_flops: null
