@@ -32,7 +32,7 @@ model_kwargs:
   decoder_embed_dim: 512
   decoder_num_heads: 8
   class_tokens: 0
-  drop_path_rate: 0.02
+  drop_path_rate: 0.0
   min_mask_frac: 0.05
   level_weight: 0.5
   level_mirror:
