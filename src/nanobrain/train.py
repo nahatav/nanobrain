@@ -267,12 +267,16 @@ def main(args: DictConfig):
             f"subject tempered sampling: alpha {args.subject_temper}, "
             f"effective images {n_eff:.0f} of {len(dataset)}"
         )
+    # never more loader workers than cpus (Colab G4: 12; the H100 reference box: 16)
+    num_workers = min(args.num_workers, len(os.sched_getaffinity(0)))
+    if num_workers < args.num_workers:
+        logger.info(f"num_workers {args.num_workers} capped to {num_workers} cpus")
     fast_prep = not args.native
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         sampler=sampler,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         # no collate (variable shapes); the fast prep plans its numpy part in the workers
         collate_fn=list if not fast_prep else functools.partial(
             prep.plan_batch,
@@ -282,7 +286,7 @@ def main(args: DictConfig):
         ),
         pin_memory=True,
         drop_last=True,
-        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        prefetch_factor=args.prefetch_factor if num_workers > 0 else None,
         worker_init_fn=ignore_sigterm,
     )
     if fast_prep:
@@ -850,11 +854,17 @@ def plot_examples(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--overrides", type=str, default=None, nargs="+")
-    args = parser.parse_args()
+    # --overrides may repeat, and bare key=value tokens after --config also count as overrides, so
+    # `--overrides name=x --config file.yaml total_steps=N` works (default < config < overrides)
+    parser.add_argument("--overrides", type=str, default=None, nargs="+", action="extend")
+    args, rest = parser.parse_known_args()
+    bad = [tok for tok in rest if tok.startswith("-") or "=" not in tok]
+    if bad:
+        parser.error(f"unrecognized arguments: {' '.join(bad)}")
+    overrides = (args.overrides or []) + rest
     cfg = OmegaConf.load(DEFAULT_CONFIG)
     if args.config:
         cfg = OmegaConf.unsafe_merge(cfg, OmegaConf.load(args.config))
-    if args.overrides:
-        cfg = OmegaConf.unsafe_merge(cfg, OmegaConf.from_dotlist(args.overrides))
+    if overrides:
+        cfg = OmegaConf.unsafe_merge(cfg, OmegaConf.from_dotlist(overrides))
     main(cfg)
