@@ -99,6 +99,11 @@ high_priority_stream: false
 decoder_prune_last: false
 # sdpa flash backend, e.g. FA3 (null = torch default)
 flash_attention_impl: null
+# FA3 is Hopper (sm_90) only: elsewhere (G4 sm_120, A100) or without flash-attn-3 the run falls
+# back to torch sdpa (same math) unless flash_attention_fallback is false (then it raises)
+flash_attention_fallback: true
+# sdpa backends allowed when FA3 is not active, subset of [flash, cudnn, efficient, math] (null = torch default)
+sdpa_backends: null
 
 # Checkpointing. checkpoint-last.pth is overwritten every checkpoint_period steps and at the end.
 # checkpoint_steps lists steps to also keep as numbered checkpoints.
