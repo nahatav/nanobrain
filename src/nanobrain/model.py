@@ -612,8 +612,8 @@ class ViTMAE3D(nn.Module):
         ref = ref.view(b, gx, 4, gy, 4, gz, 4).permute(0, 1, 3, 5, 2, 4, 6)
         return ref.reshape(b, N, 64)
 
-    def mirror_terms(self, tokens: Tensor, patches: Tensor, mask: Tensor, patch, ref: Tensor):
-        # mirror level channels: (weighted bce sum, valid weight sum, level weight sum, weighted positives [M])
+    def mirror_targets(self, patches: Tensor, mask: Tensor, patch, ref: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        # mirror level channels without the head: (target [R, M, 4, 4, 4], valid weight, level weight [R, 1, 4, 4, 4])
         x = self._to_cells8(patches.float(), patch)
         m = self._to_cells8(mask.float(), patch)
         weight = F.avg_pool3d(m, 2)
@@ -622,6 +622,11 @@ class ViTMAE3D(nn.Module):
         thr = thr.repeat_interleave(2, 2).repeat_interleave(2, 3).repeat_interleave(2, 4)
         target = F.avg_pool3d((x > thr).float() * m, 2) / weight.clamp_min(1e-6)
         m_weight = weight * (mh < 1e3).float()
+        return target, m_weight, weight
+
+    def mirror_terms(self, tokens: Tensor, patches: Tensor, mask: Tensor, patch, ref: Tensor):
+        # mirror level channels: (weighted bce sum, valid weight sum, level weight sum, weighted positives [M])
+        target, m_weight, weight = self.mirror_targets(patches, mask, patch, ref)
         logits = self.level_mirror_head(tokens).float().reshape(target.shape)
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
         return (m_weight * bce).sum(), m_weight.sum(), weight.sum(), (m_weight * target).sum((0, 2, 3, 4))
@@ -785,30 +790,45 @@ class ViTMAE3D(nn.Module):
         residuals = (self.patch_embed.residual, self.decoder_head.residual)
         residuals += (self.decoder_head.bias_residual,)
         loss = loss + 0.0 * sum(r.sum() for r in residuals)
+        mterms = []
         if self.level_head is not None and self.level_batched:
             # level_terms with one head pass and one bce over all parts (speed, same sums): the
-            # per-part targets are [rows, V, levels * sub^3] for every patch shape
+            # per-part targets are [rows, V, levels * sub^3] for every patch shape. level_mirror
+            # likewise: per-part targets (cells8 resample per patch shape), one head pass and one bce
+            def cat0(ts: list[Tensor]) -> Tensor:
+                return torch.cat(ts) if len(ts) > 1 else ts[0]
+
             with torch.no_grad():
-                tw = [
-                    level_targets(
-                        part.pop("vis_patches"), part.pop("vis_mask"), self.level_thresholds,
+                tw, mt = [], []
+                for part in parts:
+                    vis_patches, vis_mask = part.pop("vis_patches"), part.pop("vis_mask")
+                    tw.append(level_targets(
+                        vis_patches, vis_mask, self.level_thresholds,
                         *(
                             adaptive_pool_matrix(n, self.patch_size[0] // self.level_pool, device)
                             for n in part["patch"]
                         ),
-                    )
-                    for part in parts
-                ]
-                target = torch.cat([t for t, _ in tw]) if len(tw) > 1 else tw[0][0]
-                weight = torch.cat([w for _, w in tw]) if len(tw) > 1 else tw[0][1]
-            logits = self.level_head(embeds[:, self.class_tokens :]).float()
+                    ))
+                    if self.level_mirror_head is not None:
+                        mt.append(self.mirror_targets(vis_patches, vis_mask, part["patch"], part.pop("mirror_ref")))
+                target = cat0([t for t, _ in tw])
+                weight = cat0([w for _, w in tw])
+            tokens = embeds[:, self.class_tokens :]
+            logits = self.level_head(tokens).float()
             bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
             num = (weight * bce).sum()
             den = weight.sum()  # weight is repeated over the levels: level_terms' weight.sum() * L
             loss = loss + self.level_weight * num / den.clamp_min(1e-6)
+            if mt:
+                m_target, m_weight, l_weight = (cat0([t[k] for t in mt]) for k in range(3))
+                m_logits = self.level_mirror_head(tokens).float().reshape(m_target.shape)
+                m_bce = F.binary_cross_entropy_with_logits(m_logits, m_target, reduction="none")
+                mterms.append((
+                    (m_weight * m_bce).sum(), m_weight.sum(), l_weight.sum(),
+                    (m_weight * m_target).sum((0, 2, 3, 4)),
+                ))
         elif self.level_head is not None:
             num, den = 0.0, 0.0
-            mterms = []
             rows = torch.split(embeds, [len(part["ids"]) * num_samples for part in parts])
             for part, tokens in zip(parts, rows):
                 vis_patches, vis_mask = part.pop("vis_patches"), part.pop("vis_mask")
@@ -819,18 +839,18 @@ class ViTMAE3D(nn.Module):
                         tokens[:, self.class_tokens :], vis_patches, vis_mask, part["patch"], part.pop("mirror_ref")
                     ))
             loss = loss + self.level_weight * num / den.clamp_min(1e-6)
-            if mterms:
-                # summed over groups: (weighted bce, valid weight, level weight, weighted positives [M])
-                mb, mw, lw, mp = [sum(t[k] for t in mterms) for k in range(4)]
-                T = len(self.level_thresholds)
-                # same per-channel weight as the level channels (r18: / (valid weight * T))
-                loss = loss + self.level_weight * mb / (mw * T).clamp_min(1e-6)
-                M = len(self.level_mirror)
-                self.level_mirror_stats = {
-                    "bce": (mb / (mw * M).clamp_min(1e-6)).detach(),
-                    "valid": (mw / lw.clamp_min(1e-6)).detach(),
-                    **{f"pos{t:g}": v for t, v in zip(self.level_mirror, (mp / mw.clamp_min(1e-6)).detach())},
-                }
+        if mterms:
+            # summed over groups: (weighted bce, valid weight, level weight, weighted positives [M])
+            mb, mw, lw, mp = [sum(t[k] for t in mterms) for k in range(4)]
+            T = len(self.level_thresholds)
+            # same per-channel weight as the level channels (r18: / (valid weight * T))
+            loss = loss + self.level_weight * mb / (mw * T).clamp_min(1e-6)
+            M = len(self.level_mirror)
+            self.level_mirror_stats = {
+                "bce": (mb / (mw * M).clamp_min(1e-6)).detach(),
+                "valid": (mw / lw.clamp_min(1e-6)).detach(),
+                **{f"pos{t:g}": v for t, v in zip(self.level_mirror, (mp / mw.clamp_min(1e-6)).detach())},
+            }
         if self.fino_heads is not None and fino_meta is not None:
             # the global embedding of each sequence: mean of its visible encoder tokens (eval:
             # mean of all brain-touching tokens); rows are part by part, image-major
