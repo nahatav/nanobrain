@@ -1,9 +1,9 @@
 name: best
 notes: 'best stack v1: Ryan ms-natinit recipe (ImageNet MAE init, Muon, FINO age,
-  level head) + level_mirror [1.0,1.5,2.0] m0.5 + decoder depth 6 + drop_path 0.02
-  + eval-matched filelist L4 (leaked OpenBHB datasets removed) + full-context cooldown
-  (visible 1280, last 10%). Step keyed, matched to the H100 hour from A100 timing;
-  h100_time_limit 59.5 caps any H100 rerun.'
+  level head) + level_mirror [1.0,1.5,2.0] m0.5 + decoder depth 6 + eval-matched filelist
+  L4 (leaked OpenBHB datasets removed) + full-context cooldown (visible 1280, last
+  10%). Step keyed, matched to the H100 hour from A100 timing; h100_time_limit 59.5
+  caps any H100 rerun.'
 output_dir: output
 train_filelist: /content/L4.txt
 anneal_filelist: null
