@@ -7,7 +7,7 @@
 # Slurm options for the MedARC cluster. Edit for yours.
 #SBATCH --job-name=nanobrain
 #SBATCH --partition=n
-#SBATCH --account=sophont
+#SBATCH --account=training
 #SBATCH --gpus=1
 #SBATCH --time=3:00:00
 #SBATCH --requeue
