@@ -249,12 +249,16 @@ def main(args: DictConfig):
         late_indices = [ii for ii, path in enumerate(dataset.paths) if path in late]
         switch_at = (args.total_steps - args.decay_steps) * args.accum_iter * args.batch_size * world_size
         logger.info(f"anneal: {len(late_indices)} images from sample {switch_at}")
+    # spacing_bucket: K > 0 regroups each window of K batches by native voxel spacing (fewer eager
+    # per-spacing passes in forward_native, same images per window); the base stream then starts at 0
+    bucket_pool = int(args.get("spacing_bucket") or 0)
+    assert not bucket_pool or args.native, "spacing_bucket: native training only"
     sampler = InfiniteSampler(
         len(dataset),
         seed=args.seed,
-        start=start_step * args.accum_iter * args.batch_size * world_size,
-        rank=rank,
-        world_size=world_size,
+        start=0 if bucket_pool else start_step * args.accum_iter * args.batch_size * world_size,
+        rank=0 if bucket_pool else rank,
+        world_size=1 if bucket_pool else world_size,
         late_indices=late_indices,
         switch_at=switch_at,
     )
@@ -272,10 +276,32 @@ def main(args: DictConfig):
     if num_workers < args.num_workers:
         logger.info(f"num_workers {args.num_workers} capped to {num_workers} cpus")
     fast_prep = not args.native
+    if bucket_pool:
+        from nanobrain.data import SpacingBucketBatchSampler, spacing_keys
+
+        keys, key_spacings = spacing_keys(
+            dataset.paths, DATA_ROOT / "fomo300k" / "tables" / "images.parquet", args.target_spacing
+        )
+        batch_sampler = SpacingBucketBatchSampler(
+            sampler,
+            keys,
+            args.batch_size,
+            pool=bucket_pool,
+            seed=args.seed,
+            start=start_step * args.accum_iter * world_size,
+            rank=rank,
+            world_size=world_size,
+        )
+        logger.info(
+            f"spacing bucketed batches: pools of {bucket_pool} batches x {args.batch_size} images, "
+            f"{len(key_spacings)} distinct spacings in the filelist"
+        )
+        loader_kwargs = {"batch_sampler": batch_sampler}
+    else:
+        loader_kwargs = {"batch_size": args.batch_size, "sampler": sampler, "drop_last": True}
     train_loader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
+        **loader_kwargs,
         num_workers=num_workers,
         # no collate (variable shapes); the fast prep plans its numpy part in the workers
         collate_fn=list if not fast_prep else functools.partial(
@@ -285,7 +311,6 @@ def main(args: DictConfig):
             lean=args.prep_lean,
         ),
         pin_memory=True,
-        drop_last=True,
         prefetch_factor=args.prefetch_factor if num_workers > 0 else None,
         worker_init_fn=ignore_sigterm,
     )
@@ -473,6 +498,9 @@ def train(
             batch = batch_transform(misc.send_data(batch, device))
         images = batch["image"]
         masks = batch["mask"]
+        if batch.get("spacing") is not None:
+            # distinct spacings = eager per-spacing passes in forward_native (spacing_bucket lowers it)
+            metric_logger.update(groups=len(set(map(tuple, batch["spacing"]))))
 
         if args.cudagraphs:
             torch.compiler.cudagraph_mark_step_begin()
@@ -541,6 +569,8 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
+            if "groups" in metric_logger.meters:
+                log_stats["spacing_groups"] = metric_logger.meters["groups"].global_avg
             if fino_kwargs:
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
