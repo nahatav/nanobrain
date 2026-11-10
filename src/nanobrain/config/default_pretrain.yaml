@@ -176,6 +176,11 @@ natinit:
   # layer-wise lr decay over the pretrained blocks: block i gets block_lr_mult * layer_decay ** (depth - 1 - i)
   layer_decay: 1.0
   pos_scale: 1.0
+  # used when path does not exist (e.g. Colab): model.safetensors of hf_repo at hf_revision,
+  # downloaded via huggingface_hub into cache_dir (null = the HF cache). keep hf_repo matching the family
+  hf_repo: facebook/vit-mae-base
+  hf_revision: 25b184bea5538bf5c4c852c79d221195fdd2778d
+  cache_dir: null
 
 wandb: false
 wandb_entity: null
