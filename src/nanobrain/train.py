@@ -145,12 +145,21 @@ def main(args: DictConfig):
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"num params: {num_params / 1e6:.1f}M")
 
-    batch_flops = count_batch_flops(args, model, device)
-    logger.info(f"flops per batch per gpu (fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
+    if args.get("batch_flops"):
+        # startup: skip the eager fwd + bwd under FlopCounterMode, take a count logged by an earlier run
+        batch_flops = float(args.batch_flops)
+        logger.info(f"flops per batch per gpu (fwd + bwd): {batch_flops / 1e12:.2f} TFLOP (from config)")
+    else:
+        batch_flops = count_batch_flops(args, model, device)
+        logger.info(f"flops per batch per gpu (fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
 
     model_without_ddp = model
     if args.distributed:
         model = DDP(model, broadcast_buffers=False)
+
+    compile_cache = args.get("compile_cache") if args.compile else None
+    if compile_cache:
+        load_compile_cache(Path(compile_cache))
 
     if args.compile and args.native:
         # the image shapes vary, so only the fixed-shape transformer parts compile
@@ -345,6 +354,8 @@ def main(args: DictConfig):
         stop_event,
     )
 
+    if compile_cache and misc.is_main_process():
+        save_compile_cache(Path(compile_cache))
     if args.distributed:
         dist.destroy_process_group()
     if snapshot is not None:
@@ -737,6 +748,37 @@ def setup_attention(args: DictConfig, device: torch.device) -> str:
             enable(name in backends)
     logger.info(f"attention: torch sdpa, backends {list(backends) if backends else 'torch default'}")
     return "sdpa"
+
+
+def load_compile_cache(path: Path) -> None:
+    # Inductor / AOTAutograd mega-cache (torch.compiler.save_cache_artifacts) from an earlier run of the
+    # same code, torch and gpu: compile becomes cache hits (no Triton codegen or autotune). A stale or
+    # foreign cache only costs the normal compile
+    if not path.exists():
+        logger.info(f"compile cache: {path} not found, compiling from scratch (saved at the end)")
+        return
+    try:
+        info = torch.compiler.load_cache_artifacts(path.read_bytes())
+        logger.info(f"compile cache: loaded {path} ({path.stat().st_size / 1e6:.1f} MB): {info}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"compile cache: load of {path} failed ({e!r}), compiling from scratch")
+
+
+def save_compile_cache(path: Path) -> None:
+    # after training (off the step clock), only when there is no cache yet: also holds the graphs the
+    # ctx cooldown recompiles for its longer sequences
+    if path.exists():
+        return
+    try:
+        out = torch.compiler.save_cache_artifacts()
+        if out is None:
+            logger.info("compile cache: nothing to save")
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(out[0])
+        logger.info(f"compile cache: saved {path} ({len(out[0]) / 1e6:.1f} MB)")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"compile cache: save to {path} failed ({e!r})")
 
 
 def ignore_sigterm(worker_id: int):
