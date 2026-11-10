@@ -1,7 +1,8 @@
 name: best2_speed
-notes: 'best2 + throughput package (exp/speed): batch_size 16 x num_samples 4 (same 64
-  sequences per step, same lr), spacing bucketed batches in pools of 32 batches, Inductor compile
-  cache. Same recipe otherwise. total_steps is still best2''s 22,800 until the Colab benchmark
+notes: 'best2 + throughput package (exp/speed): Ryan ms-speed cuda graphs on the native
+  encoder / decoder + batched level loss (mirror included), batch_size 16 x num_samples 4 (same
+  64 sequences per step, same lr), spacing bucketed batches in pools of 32 batches, Inductor
+  compile cache. Same recipe otherwise. total_steps is still best2''s 22,800 until the Colab benchmark
   (lit/R8_speed_impl.md) predicts the H100 step count; h100_time_limit 59.5 caps any H100 rerun.'
 output_dir: output
 train_filelist: /content/L4.txt
@@ -75,10 +76,13 @@ amp: true
 amp_dtype: bfloat16
 compile: true
 gc_freeze: true
-cudagraphs: false
+# Ryan ms-speed: the compiled encoder / decoder (fixed shapes) replay as cuda graphs, fwd and bwd
+cudagraphs: true
 fast_startup: true
 high_priority_stream: true
 decoder_prune_last: true
+# Ryan ms-speed (+ mirror): level and mirror level losses in one head pass / bce over all spacing groups
+level_batched: true
 flash_attention_impl: FA3
 flash_attention_fallback: true
 sdpa_backends:
