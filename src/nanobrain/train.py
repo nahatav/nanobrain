@@ -539,6 +539,17 @@ def train(
                 cool_progress = step / total_steps
             if cool_progress >= 1.0 - cooldown_frac:
                 num_visible = int(ctx_cooldown["num_visible"])
+                if not cooldown_logged and args.cudagraphs:
+                    # new sequence length: drop the compiled graphs and their cuda graph memory pool before
+                    # capturing the longer ones, so only one pool is ever held (two do not fit in 80 GB)
+                    import gc
+
+                    torch.compiler.reset()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    logger.info(
+                        f"ctx cooldown: cuda graphs reset, {torch.cuda.memory_reserved() / 2**30:.1f} GB reserved"
+                    )
                 if not cooldown_logged:
                     logger.info(f"ctx cooldown: num_visible {args.num_visible} -> {num_visible} at step {step}")
                     cooldown_logged = True
