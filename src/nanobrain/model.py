@@ -877,10 +877,13 @@ class ViTMAE3D(nn.Module):
                     return None
                 return torch.tensor(table, device=device)[gseq] * (0.75 + 0.5 * torch.rand(nb, device=device))
 
-            lo = None
-            if gseq is not None and (self.blob_prob > 0 or self.stroke_prob > 0 or sp in tumors):
-                # each image's in-mask minimum: darkening lesions never go below it
-                lo = torch.where(vols[1] > 0, vols[0], torch.inf).amin((1, 2, 3)).view(-1, 1, 1, 1)
+            lo = hi = None
+            if self.training and (self.blob_prob > 0 or self.stroke_prob > 0 or sp in tumors):
+                # each image's own in-mask range: lesions saturate inside it (as plan_tumors' clip), so no
+                # lesion is ever the brightest / darkest thing in the brain (a trivial shortcut otherwise)
+                inm = vols[1] > 0
+                lo = torch.where(inm, vols[0], torch.inf).amin((1, 2, 3)).view(-1, 1, 1, 1)
+                hi = torch.where(inm, vols[0], -torch.inf).amax((1, 2, 3)).view(-1, 1, 1, 1)
             if self.training and self.blob_prob > 0:
                 lesion = insert_blobs(
                     vols[0], vols[1], patch, sp, self.blob_prob, self.blob_max, self.blob_radius,
@@ -899,7 +902,9 @@ class ViTMAE3D(nn.Module):
                 tumor = paste_tumors(vols[0], vols[1], tumors[sp], with_mask=want_lesion or gseq is not None)
                 if gseq is not None:
                     diff = vols[0] - before
-                    vols[0] = before + diff * gains(TUMOR_GAIN).view(-1, 1, 1, 1)
+                    g = gains(TUMOR_GAIN).view(-1, 1, 1, 1)
+                    # bright sequences keep the rim / core pattern; darkening ones (T1w) darken the whole mass
+                    vols[0] = before + torch.where(g >= 0, diff * g, diff.abs() * g)
                     # peritumoral edema: a soft shell ~6-12 mm around the mass, bright on FLAIR / T2
                     halo_amp = torch.tensor(HALO_AMP, device=device)[gseq] * (0.6 + 0.8 * torch.rand(nb, device=device))
                     halo = edema_halo(tumor, vols[1], sp)
@@ -914,7 +919,7 @@ class ViTMAE3D(nn.Module):
                 if want_lesion and tumor is not None:
                     lesion = tumor if lesion is None else torch.maximum(lesion, tumor)
             if lo is not None:
-                vols[0] = torch.where(vols[1] > 0, torch.maximum(vols[0], lo), vols[0])
+                vols[0] = torch.where(vols[1] > 0, torch.minimum(torch.maximum(vols[0], lo), hi), vols[0])
             lesion_patches = None if lesion is None else patchify3d(lesion, patch)
             lesion_enh_patches = None if lesion_enh is None else patchify3d(lesion_enh, patch)
             vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
@@ -1565,60 +1570,63 @@ def insert_strokes(
     radius: tuple[float, float],
     contrast: tuple[float, float],
     edge: float,
-    box_mm: float = 64.0,
+    box_mm: float = 48.0,
     with_mask: bool = False,
     gain: Tensor | None = None,
 ) -> Tensor | None:
     # stroke-like lesions (new): in place on a spacing group's padded volumes [B, X, Y, Z], per image
     # (share prob) one irregular infarct made of 2 to num overlapping elongated soft ellipsoids whose
-    # centres scatter (sd spread mm) around a seed in a patch >= 90% in the mask: lobulated, uneven,
-    # DWI/FLAIR-bright territories rather than the round masses of plan_tumors. same mechanics as
-    # insert_blobs (sizes in mm, boundary noise, soft edge, in-mask only). with_mask: soft mask [B, X, Y, Z]
+    # centres scatter (sd spread mm) around a seed in a patch >= 90% in the mask: lobulated, uneven
+    # territories rather than the round masses of plan_tumors. same mechanics as insert_blobs (sizes in
+    # mm, boundary noise, soft edge, in-mask only); geometry is built only for the chosen images.
+    # gain [B]: per-image signed contrast scale (bright on DWI, dark on ADC). with_mask: soft mask [B, X, Y, Z]
     B, X, Y, Z = images.shape
     dev = images.device
+    chosen = (torch.rand(B, device=dev) < prob).nonzero().flatten()
+    out = torch.zeros_like(images) if with_mask else None
+    n = int(chosen.numel())
+    if n == 0:
+        return out
     dims = torch.tensor([X, Y, Z], device=dev)
     pt = torch.tensor(patch, device=dev)
     mm = torch.tensor(sp, device=dev, dtype=torch.float32)
     gx, gy, gz = X // patch[0], Y // patch[1], Z // patch[2]
-    ok = mask.view(B, gx, patch[0], gy, patch[1], gz, patch[2]).float().mean((2, 4, 6)).view(B, -1) >= 0.9
-    idx = (torch.rand(B, ok.shape[1], device=dev) + ok.float()).argmax(-1)
+    m_sel = mask.index_select(0, chosen)
+    ok = m_sel.view(n, gx, patch[0], gy, patch[1], gz, patch[2]).float().mean((2, 4, 6)).view(n, -1) >= 0.9
+    idx = (torch.rand(n, ok.shape[1], device=dev) + ok.float()).argmax(-1)
     cell = torch.stack([idx // (gy * gz), idx // gz % gy, idx % gz], -1)
-    seed = (cell * pt).float() + torch.rand(B, 3, device=dev) * pt
+    seed = (cell * pt).float() + torch.rand(n, 3, device=dev) * pt
     # foci around the seed, in voxels of this spacing, kept inside the volume
-    centre = seed[:, None] + torch.randn(B, num, 3, device=dev) * spread / mm
+    centre = seed[:, None] + torch.randn(n, num, 3, device=dev) * spread / mm
     centre = torch.minimum(centre.clamp_min(0), (dims - 1).float())
     box = [min(d, math.ceil(box_mm / s)) for d, s in zip((X, Y, Z), sp)]
     bt = torch.tensor(box, device=dev)
     lo = torch.minimum((centre.long() - bt // 2).clamp_min(0), dims - bt)
-    r = torch.exp(torch.rand(B, num, 1, device=dev) * math.log(radius[1] / radius[0]) + math.log(radius[0]))
+    r = torch.exp(torch.rand(n, num, 1, device=dev) * math.log(radius[1] / radius[0]) + math.log(radius[0]))
     # elongated, unevenly shaped foci
-    axes = r * torch.exp(torch.rand(B, num, 3, device=dev) - 0.5)
-    knots = 0.15 * torch.randn(B * num, 1, 4, 4, 4, device=dev)
-    pert = F.interpolate(knots, size=box, mode="trilinear", align_corners=True).view(B, num, -1)
-    grid = torch.meshgrid(*[torch.arange(n, device=dev) for n in box], indexing="ij")
+    axes = r * torch.exp(torch.rand(n, num, 3, device=dev) - 0.5)
+    knots = 0.15 * torch.randn(n * num, 1, 4, 4, 4, device=dev)
+    pert = F.interpolate(knots, size=box, mode="trilinear", align_corners=True).view(n, num, -1)
+    grid = torch.meshgrid(*[torch.arange(k, device=dev) for k in box], indexing="ij")
     pos = lo[:, :, None] + torch.stack(grid, -1).view(1, 1, -1, 3)
     d = ((pos - centre[:, :, None]) * mm / axes[:, :, None]).norm(dim=-1) * (1 + pert)
-    on = (torch.rand(B, 1, device=dev) < prob) & (
-        torch.arange(num, device=dev) < torch.randint(2, num + 1, (B, 1), device=dev)
-    )
+    on = torch.arange(num, device=dev) < torch.randint(2, num + 1, (n, 1), device=dev)
     # one brightness per infarct (foci of one lesion share their signal), slight per-focus jitter
-    amp = (torch.rand(B, 1, 1, device=dev) * (contrast[1] - contrast[0]) + contrast[0])
-    amp = amp * (0.85 + 0.3 * torch.rand(B, num, 1, device=dev)) * on[..., None]
+    amp = torch.rand(n, 1, 1, device=dev) * (contrast[1] - contrast[0]) + contrast[0]
+    amp = amp * (0.85 + 0.3 * torch.rand(n, num, 1, device=dev)) * on[..., None]
     flat = (pos[..., 0] * Y + pos[..., 1]) * Z + pos[..., 2]
-    flat = (flat + torch.arange(B, device=dev).view(-1, 1, 1) * (X * Y * Z)).view(-1)
+    flat = (flat + chosen.view(-1, 1, 1) * (X * Y * Z)).view(-1)
     soft = torch.sigmoid((1 - d) * r / edge)
     inside = mask.reshape(-1)[flat].float()
     # overlapping foci saturate instead of stacking: per voxel max of amp * soft over the foci, then the
-    # per-image signed gain (gain [B]: e.g. bright on DWI, dark on ADC)
+    # per-image signed gain
     add = torch.zeros_like(images)
     add.view(-1).scatter_reduce_(0, flat, ((amp * soft).view(-1) * inside).to(add.dtype), "amax")
     if gain is not None:
         add = add * gain.view(B, 1, 1, 1).to(add.dtype)
     images.add_(add)
-    if not with_mask:
-        return None
-    out = torch.zeros_like(images)
-    out.view(-1).scatter_reduce_(0, flat, ((soft * on[..., None]).view(-1) * inside).to(out.dtype), "amax")
+    if with_mask:
+        out.view(-1).scatter_reduce_(0, flat, ((soft * on[..., None]).view(-1) * inside).to(out.dtype), "amax")
     return out
 
 
