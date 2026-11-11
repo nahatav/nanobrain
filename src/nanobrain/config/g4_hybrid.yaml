@@ -10,11 +10,12 @@ notes: 'hybrid v1 (exp/hybrid): Ryan''s validated recipe (natinit MAE-B, Muon, F
   r24_syn, prob 0.5) + NEW stroke-like infarcts (prob 0.3) with a dense lesion head
   (w 0.5) and a NEW global lesion presence/burden head on the pooled embedding (w
   0.1) + NEW context level head (24/40 mm, w 0.25) + decoder depth 6 + full-context
-  cooldown (visible 1280, last 10%) + eval-matched filelist L7 in this repo (leaked
-  OpenBHB datasets removed) + Ryan ms-speed (cuda graphs, batched level loss) + spacing-bucketed
-  batches (rtd_ratio 0.107 keeps the RTD swap count). Trained off-H100 (Colab A100),
-  step keyed, steps matched to the H100 hour from measured A100 cost ratios with a
-  margin; h100_time_limit 59.5 caps any H100 rerun.'
+  cooldown (visible 1024, last 10%; no cuda graphs in the cooldown, 1280 does not
+  fit in 80 GB) + eval-matched filelist L7 in this repo (leaked OpenBHB datasets removed)
+  + Ryan ms-speed (cuda graphs, batched level loss) + spacing-bucketed batches (rtd_ratio
+  0.107 keeps the RTD swap count). Trained off-H100 (Colab A100), step keyed, steps
+  matched to the H100 hour from measured A100 cost ratios with a margin; h100_time_limit
+  59.5 caps any H100 rerun.'
 output_dir: output
 train_filelist: src/nanobrain/config/L7_l4_t1wboost138.txt
 anneal_filelist: null
@@ -166,7 +167,7 @@ wandb_entity: null
 wandb_project: nanobrain-climb
 ctx_cooldown:
   frac: 0.1
-  num_visible: 1280
+  num_visible: 1024
 h100_time_limit: 59.5
 subject_temper: 0.5
 level_batched: true
