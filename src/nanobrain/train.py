@@ -542,8 +542,6 @@ def train(
                 if not cooldown_logged and args.cudagraphs:
                     # new sequence length: drop the compiled graphs and their cuda graph memory pool before
                     # capturing the longer ones, so only one pool is ever held (two do not fit in 80 GB)
-                    import gc
-
                     torch.compiler.reset()
                     gc.collect()
                     torch.cuda.empty_cache()
