@@ -7,14 +7,15 @@ notes: 'hybrid v1 (exp/hybrid): Ryan''s validated recipe (natinit MAE-B, Muon, F
   bright on DWI / dark on ADC, foci bright on FLAIR/T2; FLAIR/T2-bright peritumoral
   edema halo in the whole-lesion label; second lesion-head channel for the T1c enhancing
   part, like BraTS ET/WT): tumours (ring/diffuse/nodule; generators ported from mihirneal
-  r24_syn, prob 0.5) + NEW stroke-like infarcts (prob 0.3) + small foci (prob 0.2)
-  with a dense lesion head (w 0.5) and a NEW global lesion presence/burden head on
-  the pooled embedding (w 0.1) + NEW context level head (24/40 mm, w 0.25) + NEW local
-  anomaly head (w 0.5) + decoder depth 6 + full-context cooldown (visible 1280, last
-  10%) + eval-matched filelist L7 in this repo (leaked OpenBHB datasets removed) +
-  Ryan ms-speed (cuda graphs, batched level loss). Trained off-H100 (Colab A100),
-  step keyed, steps matched to the H100 hour from measured A100 cost ratios with a
-  margin; h100_time_limit 59.5 caps any H100 rerun.'
+  r24_syn, prob 0.5) + NEW stroke-like infarcts (prob 0.3) with a dense lesion head
+  (w 0.5) and a NEW global lesion presence/burden head on the pooled embedding (w
+  0.1) + NEW context level head (24/40 mm, w 0.25) + NEW local anomaly head (w 0.5)
+  + decoder depth 6 + full-context cooldown (visible 1280, last 10%) + eval-matched
+  filelist L7 in this repo (leaked OpenBHB datasets removed) + Ryan ms-speed (cuda
+  graphs, batched level loss) + spacing-bucketed batches (rtd_ratio 0.107 keeps the
+  RTD swap count). Trained off-H100 (Colab A100), step keyed, steps matched to the
+  H100 hour from measured A100 cost ratios with a margin; h100_time_limit 59.5 caps
+  any H100 rerun.'
 output_dir: output
 train_filelist: src/nanobrain/config/L7_l4_t1wboost138.txt
 anneal_filelist: null
@@ -52,7 +53,7 @@ model_kwargs:
   - 2.0
   level_mirror_margin: 0.5
   rtd_weight: 0.1
-  rtd_ratio: 0.15
+  rtd_ratio: 0.107
   rtd_quantiles: 32
   ctx_weight: 0.25
   ctx_windows:
@@ -67,7 +68,7 @@ model_kwargs:
   tumor_prob: 0.5
   lesion_mask_weight: 0.5
   stroke_prob: 0.3
-  blob_prob: 0.2
+  blob_prob: 0.0
   blob_max: 4
   blob_radius:
   - 2.0
@@ -170,3 +171,4 @@ ctx_cooldown:
 h100_time_limit: 59.5
 subject_temper: 0.5
 level_batched: true
+spacing_bucket: 32

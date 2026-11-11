@@ -877,13 +877,6 @@ class ViTMAE3D(nn.Module):
                     return None
                 return torch.tensor(table, device=device)[gseq] * (0.75 + 0.5 * torch.rand(nb, device=device))
 
-            lo = hi = None
-            if self.training and (self.blob_prob > 0 or self.stroke_prob > 0 or sp in tumors):
-                # each image's own in-mask range: lesions saturate inside it (as plan_tumors' clip), so no
-                # lesion is ever the brightest / darkest thing in the brain (a trivial shortcut otherwise)
-                inm = vols[1] > 0
-                lo = torch.where(inm, vols[0], torch.inf).amin((1, 2, 3)).view(-1, 1, 1, 1)
-                hi = torch.where(inm, vols[0], -torch.inf).amax((1, 2, 3)).view(-1, 1, 1, 1)
             if self.training and self.blob_prob > 0:
                 lesion = insert_blobs(
                     vols[0], vols[1], patch, sp, self.blob_prob, self.blob_max, self.blob_radius,
@@ -898,28 +891,42 @@ class ViTMAE3D(nn.Module):
                 if stroke is not None:
                     lesion = stroke if lesion is None else torch.maximum(lesion, stroke)
             if sp in tumors:
-                before = vols[0].clone() if gseq is not None else None
-                tumor = paste_tumors(vols[0], vols[1], tumors[sp], with_mask=want_lesion or gseq is not None)
+                flat, val, soft, lim = tumors[sp]
+                vox = math.prod(vols.shape[2:])
+                owner = torch.div(flat, vox, rounding_mode="floor")
                 if gseq is not None:
-                    diff = vols[0] - before
-                    g = gains(TUMOR_GAIN).view(-1, 1, 1, 1)
-                    # bright sequences keep the rim / core pattern; darkening ones (T1w) darken the whole mass
-                    vols[0] = before + torch.where(g >= 0, diff * g, diff.abs() * g)
-                    # peritumoral edema: a soft shell ~6-12 mm around the mass, bright on FLAIR / T2
-                    halo_amp = torch.tensor(HALO_AMP, device=device)[gseq] * (0.6 + 0.8 * torch.rand(nb, device=device))
-                    halo = edema_halo(tumor, vols[1], sp)
-                    vols[0] = vols[0] + halo * halo_amp.view(-1, 1, 1, 1)
+                    # signed per-sequence gain per voxel of each mass: bright sequences keep the rim / core
+                    # pattern, darkening ones (T1w) darken the whole mass; plan_tumors' clip keeps the range
+                    g = gains(TUMOR_GAIN)[owner]
+                    val = torch.where(g >= 0, val * g, val.abs() * g)
+                need_mask = want_lesion or gseq is not None
+                tumor = paste_tumors(vols[0], vols[1], (flat, val, soft, lim), with_mask=need_mask)
+                if gseq is not None:
+                    timg = torch.unique(owner)
+                    t_sub = tumor.index_select(0, timg)
+                    m_sub = vols[1].index_select(0, timg)
+                    # peritumoral edema (~6-12 mm, FLAIR / T2 bright) on the tumour images only, clipped to each
+                    # image's own in-mask range
+                    halo_amp = torch.tensor(HALO_AMP, device=device)[gseq[timg]] * (
+                        0.6 + 0.8 * torch.rand(len(timg), device=device)
+                    )
+                    halo = edema_halo(t_sub, m_sub, sp)
+                    i_sub = vols[0].index_select(0, timg)
+                    inm = m_sub > 0
+                    lo_i = torch.where(inm, i_sub, torch.inf).amin((1, 2, 3)).view(-1, 1, 1, 1)
+                    hi_i = torch.where(inm, i_sub, -torch.inf).amax((1, 2, 3)).view(-1, 1, 1, 1)
+                    i_sub = torch.where(inm, torch.minimum(torch.maximum(i_sub + halo * halo_amp.view(-1, 1, 1, 1), lo_i), hi_i), i_sub)
+                    vols[0].index_copy_(0, timg, i_sub)
                     if self.lesion_subregions and want_lesion:
-                        # enhancing part (BraTS ET): voxels the mass brightens by > 0.5 z, on T1c only
-                        is_t1c = (gseq == SEQ_T1C).view(-1, 1, 1, 1)
-                        lesion_enh = ((diff > 0.5) & is_t1c).to(vols.dtype) * tumor
+                        # enhancing part (BraTS ET): voxels a mass brightens by > 0.5 z, on T1c images only
+                        lesion_enh = torch.zeros_like(vols[0])
+                        enh_on = ((val > 0.5) & (gseq[owner] == SEQ_T1C)).to(soft.dtype) * soft
+                        lesion_enh.view(-1).index_copy_(0, flat, enh_on.to(lesion_enh.dtype))
                     # whole-lesion label (BraTS WT): mass + edema where the edema is visible (FLAIR / T2)
-                    tumor = torch.maximum(tumor, halo * (halo_amp >= 0.5).view(-1, 1, 1, 1).to(halo.dtype))
-                    del before, diff
+                    t_sub = torch.maximum(t_sub, halo * (halo_amp >= 0.5).view(-1, 1, 1, 1).to(halo.dtype))
+                    tumor.index_copy_(0, timg, t_sub)
                 if want_lesion and tumor is not None:
                     lesion = tumor if lesion is None else torch.maximum(lesion, tumor)
-            if lo is not None:
-                vols[0] = torch.where(vols[1] > 0, torch.minimum(torch.maximum(vols[0], lo), hi), vols[0])
             lesion_patches = None if lesion is None else patchify3d(lesion, patch)
             lesion_enh_patches = None if lesion_enh is None else patchify3d(lesion_enh, patch)
             vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
@@ -1614,19 +1621,28 @@ def insert_strokes(
     # one brightness per infarct (foci of one lesion share their signal), slight per-focus jitter
     amp = torch.rand(n, 1, 1, device=dev) * (contrast[1] - contrast[0]) + contrast[0]
     amp = amp * (0.85 + 0.3 * torch.rand(n, num, 1, device=dev)) * on[..., None]
+    # flat indices into the chosen images' own [n, X, Y, Z] buffers (no full-group temporaries)
     flat = (pos[..., 0] * Y + pos[..., 1]) * Z + pos[..., 2]
-    flat = (flat + chosen.view(-1, 1, 1) * (X * Y * Z)).view(-1)
+    flat = (flat + torch.arange(n, device=dev).view(-1, 1, 1) * (X * Y * Z)).view(-1)
     soft = torch.sigmoid((1 - d) * r / edge)
-    inside = mask.reshape(-1)[flat].float()
+    inside = m_sel.reshape(-1)[flat].float()
+    img_sel = images.index_select(0, chosen)
+    inm = m_sel > 0
+    # each chosen image's own in-mask range: the infarct saturates inside it
+    lo_i = torch.where(inm, img_sel, torch.inf).amin((1, 2, 3)).view(-1, 1, 1, 1)
+    hi_i = torch.where(inm, img_sel, -torch.inf).amax((1, 2, 3)).view(-1, 1, 1, 1)
     # overlapping foci saturate instead of stacking: per voxel max of amp * soft over the foci, then the
     # per-image signed gain
-    add = torch.zeros_like(images)
+    add = torch.zeros_like(img_sel)
     add.view(-1).scatter_reduce_(0, flat, ((amp * soft).view(-1) * inside).to(add.dtype), "amax")
     if gain is not None:
-        add = add * gain.view(B, 1, 1, 1).to(add.dtype)
-    images.add_(add)
+        add = add * gain.index_select(0, chosen).view(n, 1, 1, 1).to(add.dtype)
+    img_sel = torch.where(inm, torch.minimum(torch.maximum(img_sel + add, lo_i), hi_i), img_sel)
+    images.index_copy_(0, chosen, img_sel)
     if with_mask:
-        out.view(-1).scatter_reduce_(0, flat, ((soft * on[..., None]).view(-1) * inside).to(out.dtype), "amax")
+        m_out = torch.zeros_like(img_sel)
+        m_out.view(-1).scatter_reduce_(0, flat, ((soft * on[..., None]).view(-1) * inside).to(m_out.dtype), "amax")
+        out.index_copy_(0, chosen, m_out)
     return out
 
 
