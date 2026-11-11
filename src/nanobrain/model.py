@@ -131,6 +131,13 @@ class ViTMAE3D(nn.Module):
         global_lesion_weight: float = 0.0,
         # hybrid conv stem (new): see PatchConvStem; 0 = off (pure linear patch embedding)
         conv_stem_width: int = 0,
+        # contrast-aware lesions (new; needs fino3d metadata for the per-image MRI sequence): each lesion
+        # kind's intensity change is scaled per sequence as it appears clinically (tumour rim bright on
+        # T1c, dark on T1w; infarct bright on DWI, dark on ADC; foci bright on FLAIR / T2), tumours get a
+        # FLAIR / T2-bright peritumoral edema halo (in the whole-lesion label, like BraTS whole tumour), and
+        # with lesion_subregions the lesion head gets a second channel: the enhancing part on T1c (BraTS ET)
+        lesion_contrast_aware: bool = False,
+        lesion_subregions: bool = False,
     ):
         super().__init__()
         self.rtd_weight = float(rtd_weight)
@@ -319,9 +326,13 @@ class ViTMAE3D(nn.Module):
         if self.lesion_mask_weight > 0 or self.global_lesion_weight > 0:
             assert any_lesion, "lesion heads: turn on blob_prob, tumor_prob or stroke_prob"
             assert patch_size == 8 and level_pool == 2, "lesion heads: 2 mm cells of 8 mm tokens"
+        self.lesion_contrast_aware = bool(lesion_contrast_aware)
+        self.lesion_subregions = bool(lesion_subregions)
+        assert not self.lesion_subregions or self.lesion_contrast_aware, "lesion_subregions: needs contrast-aware lesions"
         if self.lesion_mask_weight > 0:
             with torch.random.fork_rng(devices=[]):
-                self.lesion_head = nn.Linear(embed_dim, (patch_size // level_pool) ** 3)
+                n_ch = 2 if self.lesion_subregions else 1
+                self.lesion_head = nn.Linear(embed_dim, n_ch * (patch_size // level_pool) ** 3)
             nn.init.zeros_(self.lesion_head.weight)
             nn.init.zeros_(self.lesion_head.bias)
         if self.global_lesion_weight > 0:
@@ -838,6 +849,11 @@ class ViTMAE3D(nn.Module):
                 self.tumor_contrast, self.tumor_edge, self.tumor_nodule,
             )
         want_lesion = self.training and (self.lesion_head is not None or self.global_lesion_head is not None)
+        seq_all = None
+        if self.training and self.lesion_contrast_aware and fino_meta is not None:
+            from nanobrain.fino import COLUMNS as FINO_COLUMNS
+
+            seq_all = torch.nan_to_num(fino_meta.cpu()[:, FINO_COLUMNS.index("seq")].float(), nan=6.0).long()
         parts = []
         for sp, ids in groups.items():
             patch, box, grid, _ = geoms[sp]
@@ -851,30 +867,64 @@ class ViTMAE3D(nn.Module):
                 vols[1, jj][dst] = mask[ii][src]
             # synthetic lesions before patchify: they enter the inputs and every target (MAE, level,
             # mirror, context, anomaly), shared by an image's sequences
-            lesion = None
+            lesion, lesion_enh = None, None
+            # contrast-aware lesions: per image MRI sequence -> signed per-kind gains (x U(0.75, 1.25))
+            gseq = None if seq_all is None else seq_all[ids].to(device)
+            nb = len(ids)
+
+            def gains(table: tuple[float, ...]) -> Tensor | None:
+                if gseq is None:
+                    return None
+                return torch.tensor(table, device=device)[gseq] * (0.75 + 0.5 * torch.rand(nb, device=device))
+
+            lo = None
+            if gseq is not None and (self.blob_prob > 0 or self.stroke_prob > 0 or sp in tumors):
+                # each image's in-mask minimum: darkening lesions never go below it
+                lo = torch.where(vols[1] > 0, vols[0], torch.inf).amin((1, 2, 3)).view(-1, 1, 1, 1)
             if self.training and self.blob_prob > 0:
                 lesion = insert_blobs(
                     vols[0], vols[1], patch, sp, self.blob_prob, self.blob_max, self.blob_radius,
-                    self.blob_contrast, self.blob_edge, with_mask=want_lesion,
+                    self.blob_contrast, self.blob_edge, with_mask=want_lesion, gain=gains(BLOB_GAIN),
                 )
             if self.training and self.stroke_prob > 0:
                 stroke = insert_strokes(
                     vols[0], vols[1], patch, sp, self.stroke_prob, self.stroke_foci, self.stroke_spread,
                     self.stroke_radius, self.stroke_contrast, self.stroke_edge, with_mask=want_lesion,
+                    gain=gains(STROKE_GAIN),
                 )
                 if stroke is not None:
                     lesion = stroke if lesion is None else torch.maximum(lesion, stroke)
             if sp in tumors:
-                tumor = paste_tumors(vols[0], vols[1], tumors[sp], with_mask=want_lesion)
-                if tumor is not None:
+                before = vols[0].clone() if gseq is not None else None
+                tumor = paste_tumors(vols[0], vols[1], tumors[sp], with_mask=want_lesion or gseq is not None)
+                if gseq is not None:
+                    diff = vols[0] - before
+                    vols[0] = before + diff * gains(TUMOR_GAIN).view(-1, 1, 1, 1)
+                    # peritumoral edema: a soft shell ~6-12 mm around the mass, bright on FLAIR / T2
+                    halo_amp = torch.tensor(HALO_AMP, device=device)[gseq] * (0.6 + 0.8 * torch.rand(nb, device=device))
+                    halo = edema_halo(tumor, vols[1], sp)
+                    vols[0] = vols[0] + halo * halo_amp.view(-1, 1, 1, 1)
+                    if self.lesion_subregions and want_lesion:
+                        # enhancing part (BraTS ET): voxels the mass brightens by > 0.5 z, on T1c only
+                        is_t1c = (gseq == SEQ_T1C).view(-1, 1, 1, 1)
+                        lesion_enh = ((diff > 0.5) & is_t1c).to(vols.dtype) * tumor
+                    # whole-lesion label (BraTS WT): mass + edema where the edema is visible (FLAIR / T2)
+                    tumor = torch.maximum(tumor, halo * (halo_amp >= 0.5).view(-1, 1, 1, 1).to(halo.dtype))
+                    del before, diff
+                if want_lesion and tumor is not None:
                     lesion = tumor if lesion is None else torch.maximum(lesion, tumor)
+            if lo is not None:
+                vols[0] = torch.where(vols[1] > 0, torch.maximum(vols[0], lo), vols[0])
             lesion_patches = None if lesion is None else patchify3d(lesion, patch)
+            lesion_enh_patches = None if lesion_enh is None else patchify3d(lesion_enh, patch)
             vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
             cube = (grid, self.mask_cube) if self.mask_cube else None
             scores = sequence_scores(vols[1], num_samples, self.min_mask_frac, cube=cube).flatten(0, 1)
             parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols})
             if want_lesion:
                 parts[-1]["lesion"] = lesion_patches  # [b, N, P] soft lesion mask, or None
+                if self.lesion_subregions:
+                    parts[-1]["lesion_enh"] = lesion_enh_patches
             parts[-1]["scores"] = scores
 
         # one argsort for all groups, rows padded with 3.0 (after every score). sorts this long are
@@ -922,10 +972,11 @@ class ViTMAE3D(nn.Module):
                 part["embeds"] = part["embeds"] + self.conv_stem(cells).view(part["embeds"].shape)
             if "lesion" in part:
                 vis_ids_l = part["order"][..., :num_visible] + (torch.arange(b, device=device) * num).view(-1, 1, 1)
-                if part["lesion"] is not None:
-                    part["lesion"] = part["lesion"].flatten(0, 1).index_select(0, vis_ids_l.flatten()).view(
-                        b * num_samples, num_visible, -1
-                    )
+                for key in ("lesion", "lesion_enh"):
+                    if part.get(key) is not None:
+                        part[key] = part[key].flatten(0, 1).index_select(0, vis_ids_l.flatten()).view(
+                            b * num_samples, num_visible, -1
+                        )
                 # rtd replaced tokens show the donor, not the host: out of the lesion losses
                 part["lesion_mask"] = vis_mask
                 if "rtd_label" in part:
@@ -1145,21 +1196,28 @@ class ViTMAE3D(nn.Module):
                 wts, tgts, burden_num, burden_den = [], [], [], []
                 for part in parts:
                     les, msk, patch = part.pop("lesion"), part.pop("lesion_mask"), part["patch"]
+                    enh = part.pop("lesion_enh", None)
                     rows, V = msk.shape[:2]
                     px, py, pz = patch
                     m = msk.float().reshape(-1, 1, px, py, pz)
                     w = F.adaptive_avg_pool3d(m, sub).flatten(1)  # [rows*V, 64]
-                    if les is None:
-                        t = torch.zeros_like(w)
-                        burden_num.append(m.new_zeros(rows))
-                    else:
-                        lm = les.float().reshape(m.shape) * m
-                        t = F.adaptive_avg_pool3d(lm, sub).flatten(1) / w.clamp_min(1e-6)
-                        burden_num.append(lm.view(rows, -1).sum(1))
+
+                    def frac(t: Tensor | None) -> Tensor:
+                        # in-mask lesion fraction of each 2 mm sub-block
+                        if t is None:
+                            return torch.zeros_like(w)
+                        return F.adaptive_avg_pool3d(t.float().reshape(m.shape) * m, sub).flatten(1) / w.clamp_min(1e-6)
+
+                    t = frac(les)
+                    if self.lesion_subregions:
+                        t = torch.stack([t, frac(enh)], 1)  # [rows*V, 2, 64]: whole lesion, enhancing part
+                    burden_num.append(m.new_zeros(rows) if les is None else (les.float().reshape(m.shape) * m).view(rows, -1).sum(1))
                     burden_den.append(m.view(rows, -1).sum(1))
                     wts.append(w)
                     tgts.append(t)
                 weight, target = torch.cat(wts), torch.cat(tgts)
+                if self.lesion_subregions:
+                    weight = weight[:, None].expand_as(target)
                 # visible lesion burden per sequence: presence and log10 burden scaled to [0, 1]
                 burden = torch.cat(burden_num) / torch.cat(burden_den).clamp_min(1.0)
                 present = (burden > 1e-3).float()
@@ -1171,7 +1229,11 @@ class ViTMAE3D(nn.Module):
                 les_loss = (weight * bce).sum() / lw
                 loss = loss + self.lesion_mask_weight * les_loss
                 stats["les_bce"] = les_loss.detach()
-                stats["les_pos"] = ((weight * target).sum() / lw).detach()
+                if self.lesion_subregions:
+                    stats["les_pos"] = ((weight[:, 0] * target[:, 0]).sum() / weight[:, 0].sum().clamp_min(1e-6)).detach()
+                    stats["enh_pos"] = ((weight[:, 1] * target[:, 1]).sum() / weight[:, 1].sum().clamp_min(1e-6)).detach()
+                else:
+                    stats["les_pos"] = ((weight * target).sum() / lw).detach()
             if self.global_lesion_head is not None:
                 pooled = tokens.mean(dim=1)  # [rows, D]: the eval global embedding's training analog
                 g = self.global_lesion_head(pooled).float()
@@ -1295,8 +1357,9 @@ def level_targets(
 
 
 
-# synthetic lesions: insert_blobs, paste_tumors and plan_tumors are ported verbatim from mihirneal's
-# nanobrain run r24_syn (labless run_sub_463a0d7b5e, github.com/mihirneal/nanobrain, MIT)
+# synthetic lesions: insert_blobs, paste_tumors and plan_tumors are ported from mihirneal's
+# nanobrain run r24_syn (labless run_sub_463a0d7b5e, github.com/mihirneal/nanobrain, MIT); the only local
+# change is insert_blobs' optional per-image gain
 def insert_blobs(
     images: Tensor,
     mask: Tensor,
@@ -1309,7 +1372,9 @@ def insert_blobs(
     edge: float,
     box_mm: float = 40.0,
     with_mask: bool = False,
+    gain: Tensor | None = None,
 ) -> Tensor | None:
+    # (ported from mihirneal r24_syn; local addition: gain [B], a per-image signed contrast scale)
     # in place on a spacing group's padded volumes [B, X, Y, Z] (voxels of sp mm): per image (share
     # prob) 1 to num soft edged ellipsoids with a perturbed boundary, sized in mm, each in a box_mm
     # box and centred in a patch >= 90% in the mask. with_mask: returns the soft blob mask [B, X, Y, Z]
@@ -1338,6 +1403,8 @@ def insert_blobs(
         torch.arange(num, device=dev) < torch.randint(1, num + 1, (B, 1), device=dev)
     )
     amp = (torch.rand(B, num, 1, device=dev) * (contrast[1] - contrast[0]) + contrast[0]) * on[..., None]
+    if gain is not None:
+        amp = amp * gain.view(B, 1, 1).to(amp.dtype)
     flat = (pos[..., 0] * Y + pos[..., 1]) * Z + pos[..., 2]
     flat = (flat + torch.arange(B, device=dev).view(-1, 1, 1) * (X * Y * Z)).view(-1)
     soft = torch.sigmoid((1 - d) * r / edge)
@@ -1500,6 +1567,7 @@ def insert_strokes(
     edge: float,
     box_mm: float = 64.0,
     with_mask: bool = False,
+    gain: Tensor | None = None,
 ) -> Tensor | None:
     # stroke-like lesions (new): in place on a spacing group's padded volumes [B, X, Y, Z], per image
     # (share prob) one irregular infarct made of 2 to num overlapping elongated soft ellipsoids whose
@@ -1540,15 +1608,46 @@ def insert_strokes(
     flat = (flat + torch.arange(B, device=dev).view(-1, 1, 1) * (X * Y * Z)).view(-1)
     soft = torch.sigmoid((1 - d) * r / edge)
     inside = mask.reshape(-1)[flat].float()
-    # overlapping foci saturate instead of stacking: per voxel max of amp * soft over the foci
+    # overlapping foci saturate instead of stacking: per voxel max of amp * soft over the foci, then the
+    # per-image signed gain (gain [B]: e.g. bright on DWI, dark on ADC)
     add = torch.zeros_like(images)
     add.view(-1).scatter_reduce_(0, flat, ((amp * soft).view(-1) * inside).to(add.dtype), "amax")
+    if gain is not None:
+        add = add * gain.view(B, 1, 1, 1).to(add.dtype)
     images.add_(add)
     if not with_mask:
         return None
     out = torch.zeros_like(images)
     out.view(-1).scatter_reduce_(0, flat, ((soft * on[..., None]).view(-1) * inside).to(out.dtype), "amax")
     return out
+
+
+# contrast-aware lesion appearance (signed intensity gain per MRI sequence code, nanobrain.fino.sequence_code:
+# 0 T1w, 1 T1c, 2 T2w / PDw / DWI b0, 3 FLAIR, 4 DWI, 5 ADC, 6 other). Tumours: enhancing rim / mass bright on T1c,
+# bright on T2 / FLAIR, hypointense on T1w, mild on DWI / ADC. Acute infarcts: bright on DWI, dark on ADC, mildly
+# bright on T2 / FLAIR, mildly dark on T1. Small foci (WMH-like): bright on FLAIR / T2, faint elsewhere.
+SEQ_T1C = 1
+TUMOR_GAIN = (-0.6, 1.0, 0.9, 1.0, 0.4, 0.5, 1.0)
+STROKE_GAIN = (-0.5, -0.4, 0.8, 0.9, 1.0, -0.9, 1.0)
+BLOB_GAIN = (-0.3, 0.3, 1.0, 1.0, 0.3, 0.3, 1.0)
+# peritumoral edema amplitude (z): hyperintense on FLAIR / T2, faint on T1 and diffusion
+HALO_AMP = (-0.2, 0.0, 0.9, 1.0, 0.2, 0.4, 0.5)
+
+
+def edema_halo(tumor: Tensor, mask: Tensor, sp: tuple[float, float, float], reach_mm: float = 6.0) -> Tensor:
+    # soft shell around each mass [B, X, Y, Z] in [0, 1]: the mass mask box-blurred twice (separable,
+    # +-reach_mm per pass, so the edema reaches ~6-12 mm), saturated, minus the mass itself, in the brain only
+    x = tumor.float()[:, None]
+    for _ in range(2):
+        for axis, s_mm in enumerate(sp):
+            k = 2 * max(1, round(reach_mm / s_mm)) + 1
+            size = [1, 1, 1]
+            size[axis] = k
+            pad = [0, 0, 0]
+            pad[axis] = k // 2
+            x = F.avg_pool3d(x, tuple(size), 1, tuple(pad), count_include_pad=True)
+    halo = (x[:, 0] * 4.0).clamp(0.0, 1.0) * (1.0 - tumor.float()).clamp_min(0.0) * (mask > 0).float()
+    return halo.to(tumor.dtype)
 
 
 class PatchConvStem(nn.Module):

@@ -25,7 +25,10 @@ from torch import Tensor
 logger = logging.getLogger()
 
 # column order of the per-image metadata tensor; NaN = missing (masked)
-COLUMNS = ("age", "sex", "group", "field_strength", "manufacturer", "brain_volume")
+COLUMNS = ("age", "sex", "group", "field_strength", "manufacturer", "brain_volume", "seq")
+# seq: MRI sequence code per image (not a FINO target; contrast-aware synthetic lesions read it):
+# 0 T1w (incl. MP2RAGE / T1 maps), 1 T1c, 2 T2w / PDw / DWI b0, 3 FLAIR, 4 DWI (shell mean / trace / other), 5 ADC, 6 other
+SEQ_T1W, SEQ_T1C, SEQ_T2W, SEQ_FLAIR, SEQ_DWI, SEQ_ADC, SEQ_OTHER = range(7)
 CONTROL = {"control", "controls", "normal", "hc", "cn", "healthy", "healthy control",
            "healthy controls", "typically developing", "td", "nc"}
 MANUFACTURERS = ("siemens", "ge", "philips")
@@ -45,11 +48,31 @@ def normalize_group(value) -> str | None:
     return "control" if value in CONTROL else value
 
 
+def sequence_code(suffix, dwi_type) -> float:
+    s = str(suffix) if isinstance(suffix, str) else ""
+    if s in ("T1w", "MP2RAGE", "UNIT1", "T1map"):
+        return float(SEQ_T1W)
+    if s == "T1c":
+        return float(SEQ_T1C)
+    if s == "FLAIR":
+        return float(SEQ_FLAIR)
+    if s in ("T2w", "PDw"):
+        return float(SEQ_T2W)
+    if isinstance(dwi_type, str):
+        if dwi_type == "b0":
+            return float(SEQ_T2W)
+        if dwi_type == "adc":
+            return float(SEQ_ADC)
+        return float(SEQ_DWI)
+    return float(SEQ_OTHER)
+
+
 def build_meta(cfg, paths: list[str], images_parquet: str | Path) -> Tensor:
-    """Per-dataset-index metadata [N, 6] float32, joined on the sampler path
+    """Per-dataset-index metadata [N, 7] float32, joined on the sampler path
     (derivatives/<collection>/.../<stem>.npz <-> images.parquet source/<...>.nii.gz). Fills
     cfg.group_classes and cfg.age_mean / cfg.age_std (from the train filelist rows)."""
-    cols = ["path", "collection", "age", "sex", "group", "field_strength", "manufacturer", "brain_volume"]
+    cols = ["path", "collection", "age", "sex", "group", "field_strength", "manufacturer", "brain_volume", "suffix",
+            "dwi_type"]
     table = pd.read_parquet(images_parquet, columns=cols)
     key = "derivatives/" + table["path"].str.removeprefix("source/").str.removesuffix(".nii.gz") + ".npz"
     table = table.set_index(key).reindex(paths)
@@ -89,7 +112,9 @@ def build_meta(cfg, paths: list[str], images_parquet: str | Path) -> Tensor:
         cfg["bv_std"] = float(np.nanstd(bv))
     bv = (bv - cfg["bv_mean"]) / cfg["bv_std"]
 
-    meta = np.stack([age, sex, group, field, manu, bv], axis=1)
+    seq = np.array([sequence_code(su, dt) for su, dt in zip(table["suffix"], table["dwi_type"])], dtype=np.float64)
+
+    meta = np.stack([age, sex, group, field, manu, bv, seq], axis=1)
     meta[excluded] = np.nan
     known = {c: float(np.mean(~np.isnan(meta[:, ii]))) for ii, c in enumerate(COLUMNS)}
     logger.info(
