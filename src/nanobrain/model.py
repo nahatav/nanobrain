@@ -90,6 +90,19 @@ class ViTMAE3D(nn.Module):
         # threshold AND above margin + the max within +-2-4 mm of its x(L-R)-mirrored 2 mm cell
         level_mirror: tuple[float, ...] = (),
         level_mirror_margin: float = 0.5,
+        # context level channels (0 = off): a zero-init linear head on the visible encoder tokens
+        # predicts, per level threshold, the in-mask fraction of voxels above it over the
+        # ctx_windows^3 token neighborhood (24 / 40 mm), so each token carries its surroundings the way
+        # the seg probe needs to tell lesions from normally bright tissue. targets come from the full
+        # image, not from other tokens, so they work with sparse visible sets. training only
+        ctx_weight: float = 0.0,
+        ctx_windows: tuple[int, ...] = (3, 5),
+        # local anomaly channels (0 = off): per 2 mm sub-block, the in-mask fraction of voxels above
+        # mean + k * sd of the anom_window^3 token neighborhood, on a separate zero-init head: the
+        # population-free, tilt-free analog of level_mirror (midline and bilateral lesions). training only
+        anom_weight: float = 0.0,
+        anom_k: tuple[float, ...] = (1.5, 2.5),
+        anom_window: int = 5,
     ):
         super().__init__()
         self.rtd_weight = float(rtd_weight)
@@ -220,6 +233,33 @@ class ViTMAE3D(nn.Module):
             nn.init.zeros_(self.level_mirror_head.weight)
             nn.init.zeros_(self.level_mirror_head.bias)
             self.register_buffer("level_mirror_thresholds", torch.tensor(self.level_mirror), persistent=False)
+
+        # context + local anomaly heads: off the rng stream and zero init, like level_mirror
+        self.ctx_weight = float(ctx_weight)
+        self.ctx_windows = tuple(int(w) for w in ctx_windows)
+        self.anom_weight = float(anom_weight)
+        self.anom_k = tuple(float(k) for k in anom_k)
+        self.anom_window = int(anom_window)
+        # python floats: thresholds looped on the gpu without a host sync
+        self.ctx_thresholds = tuple(float(t) for t in level_thresholds)
+        self.ctx_head = None
+        self.anom_head = None
+        self.ctx_stats = {}
+        if self.ctx_weight > 0.0 or self.anom_weight > 0.0:
+            assert level_weight and native, "ctx / anom: need the level head (thresholds), native path"
+            assert patch_size == 8 and level_pool == 2, "ctx / anom: 2 mm cells of 8 mm tokens"
+            assert all(w % 2 == 1 for w in self.ctx_windows + (self.anom_window,)), "odd windows"
+        if self.ctx_weight > 0.0:
+            with torch.random.fork_rng(devices=[]):
+                self.ctx_head = nn.Linear(embed_dim, len(level_thresholds) * len(self.ctx_windows))
+            nn.init.zeros_(self.ctx_head.weight)
+            nn.init.zeros_(self.ctx_head.bias)
+        if self.anom_weight > 0.0:
+            with torch.random.fork_rng(devices=[]):
+                self.anom_head = nn.Linear(embed_dim, len(self.anom_k) * 64)
+            nn.init.zeros_(self.anom_head.weight)
+            nn.init.zeros_(self.anom_head.bias)
+            self.register_buffer("anom_k_t", torch.tensor(self.anom_k), persistent=False)
 
     @torch.no_grad()
     def rtd_replace(
@@ -624,6 +664,53 @@ class ViTMAE3D(nn.Module):
         m_weight = weight * (mh < 1e3).float()
         return target, m_weight, weight
 
+    @torch.no_grad()
+    def context_ref(self, vols: Tensor, grid) -> tuple[Tensor | None, Tensor | None]:
+        # per token of the whole image [b, N, ...]: context level targets (in-mask fraction above each
+        # level threshold over each ctx window of tokens) and the anom_window neighborhood intensity
+        # (mean, sd) used for the local anomaly targets. sums over windows via avg_pool3d * w^3
+        img, msk = vols[0], vols[1] > 0  # [b, N, P] voxels per token; no full-size float copies
+        b, N = img.shape[:2]
+        gx, gy, gz = grid
+
+        def window_sum(t: Tensor, w: int) -> Tensor:
+            # [b, N, C] token values -> [b, N, C] sums over the w^3 token neighborhood (zero padded)
+            g = t.permute(0, 2, 1).reshape(b, -1, gx, gy, gz)
+            s = F.avg_pool3d(g, w, 1, w // 2, count_include_pad=True) * (w ** 3)
+            return s.reshape(b, -1, N).permute(0, 2, 1)
+
+        cnt = msk.sum(-1, keepdim=True).float()  # [b, N, 1] in-mask voxels per token
+        ctx = None
+        if self.ctx_head is not None:
+            # one threshold at a time: bool [b, N, P] -> counts [b, N]
+            above = torch.stack([((img > t) & msk).sum(-1) for t in self.ctx_thresholds], -1).float()
+            ctx = torch.cat(
+                [window_sum(above, w) / window_sum(cnt, w).clamp_min(1.0) for w in self.ctx_windows], -1
+            )
+        stats = None
+        if self.anom_head is not None:
+            w = self.anom_window
+            xm = torch.where(msk, img, 0).float()
+            s0 = window_sum(cnt, w).clamp_min(1.0)
+            s1 = window_sum(xm.sum(-1, keepdim=True), w)
+            s2 = window_sum(xm.square().sum(-1, keepdim=True), w)
+            del xm
+            mu = s1 / s0
+            sd = (s2 / s0 - mu * mu).clamp_min(1e-4).sqrt()
+            stats = torch.cat([mu, sd], -1)  # [b, N, 2]
+        return ctx, stats
+
+    def anom_targets(self, patches: Tensor, mask: Tensor, patch, stats: Tensor) -> tuple[Tensor, Tensor]:
+        # local anomaly channels without the head: (target [R, K, 4, 4, 4], weight [R, 1, 4, 4, 4]);
+        # a voxel is positive above its neighborhood's mean + k * sd
+        x = self._to_cells8(patches.float(), patch)
+        m = self._to_cells8(mask.float(), patch)
+        weight = F.avg_pool3d(m, 2)
+        st = stats.float().reshape(-1, 2)
+        thr = (st[:, :1] + st[:, 1:] * self.anom_k_t.view(1, -1)).view(-1, len(self.anom_k), 1, 1, 1)
+        target = F.avg_pool3d((x > thr).float() * m, 2) / weight.clamp_min(1e-6)
+        return target, weight
+
     def mirror_terms(self, tokens: Tensor, patches: Tensor, mask: Tensor, patch, ref: Tensor):
         # mirror level channels: (weighted bce sum, valid weight sum, level weight sum, weighted positives [M])
         target, m_weight, weight = self.mirror_targets(patches, mask, patch, ref)
@@ -729,6 +816,19 @@ class ViTMAE3D(nn.Module):
                 ref = self.mirror_ref(vols, patch, geoms[sp][1], geoms[sp][2], sp)
                 vis_ids = part["order"][..., :num_visible] + (torch.arange(b, device=device) * num).view(-1, 1, 1)
                 part["mirror_ref"] = ref.flatten(0, 1).index_select(0, vis_ids.flatten())
+            if (self.ctx_head is not None or self.anom_head is not None) and self.training:
+                # context / local anomaly references of the visible tokens, from the whole host image
+                ctx_t, anom_st = self.context_ref(vols, geoms[sp][2])
+                vis_flat = (
+                    part["order"][..., :num_visible] + (torch.arange(b, device=device) * num).view(-1, 1, 1)
+                ).flatten()
+                rows_v = (b * num_samples, num_visible)
+                if ctx_t is not None:
+                    part["ctx_t"] = ctx_t.flatten(0, 1).index_select(0, vis_flat).view(*rows_v, -1)
+                if anom_st is not None:
+                    part["anom_st"] = anom_st.flatten(0, 1).index_select(0, vis_flat).view(*rows_v, 2)
+                    # the visible voxels the encoder saw (rtd replaced tokens are masked from the loss)
+                    part["anom_x"], part["anom_m"] = vis_patches, vis_mask
 
         def cat(key: str) -> Tensor:
             # contiguous for one group too, the compiled encoder would recompile on view strides
@@ -878,6 +978,42 @@ class ViTMAE3D(nn.Module):
                 "rtd_pos": pos.float().mean(),
             }
             self.fino_stats = {**self.fino_stats, **self.rtd_stats}
+
+        if (self.ctx_head is not None or self.anom_head is not None) and self.training:
+            tokens = embeds[:, self.class_tokens :]
+            # rtd replaced tokens carry another subject's voxels: no context / anomaly target there
+            keep = (
+                (~cat("rtd_label")).float()
+                if "rtd_label" in parts[0]
+                else tokens.new_ones(tokens.shape[:2], dtype=torch.float32)
+            )
+            stats = {}
+            if self.ctx_head is not None:
+                target = cat("ctx_t")  # [rows, V, T * windows]
+                logits = self.ctx_head(tokens).float()
+                bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none").mean(-1)
+                ctx_loss = (keep * bce).sum() / keep.sum().clamp_min(1.0)
+                loss = loss + self.ctx_weight * ctx_loss
+                stats["ctx_loss"] = ctx_loss.detach()
+            if self.anom_head is not None:
+                with torch.no_grad():
+                    tw = [
+                        self.anom_targets(part.pop("anom_x"), part.pop("anom_m"), part["patch"], part.pop("anom_st"))
+                        for part in parts
+                    ]
+                    a_target = torch.cat([t for t, _ in tw]) if len(tw) > 1 else tw[0][0]
+                    a_weight = torch.cat([w for _, w in tw]) if len(tw) > 1 else tw[0][1]
+                    a_weight = a_weight * keep.reshape(-1, 1, 1, 1, 1)
+                a_logits = self.anom_head(tokens).float().reshape(a_target.shape)
+                a_bce = F.binary_cross_entropy_with_logits(a_logits, a_target, reduction="none")
+                anom_loss = (a_weight * a_bce).sum() / (a_weight.sum() * len(self.anom_k)).clamp_min(1e-6)
+                loss = loss + self.anom_weight * anom_loss
+                with torch.no_grad():
+                    pos = (a_weight * a_target).sum((0, 2, 3, 4)) / a_weight.sum().clamp_min(1e-6)
+                stats["anom_loss"] = anom_loss.detach()
+                stats.update({f"anom_pos{k:g}": v for k, v in zip(self.anom_k, pos)})
+            self.ctx_stats = stats
+            self.fino_stats = {**self.fino_stats, **stats}
 
         if not with_state:
             return loss
