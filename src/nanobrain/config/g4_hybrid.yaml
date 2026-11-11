@@ -2,20 +2,19 @@ name: hybrid
 notes: 'hybrid v1 (exp/hybrid): Ryan''s validated recipe (natinit MAE-B, Muon, FINO
   age, level head, subject-tempered sampling 0.5, cross-subject RTD 0.1) + level_mirror
   + NEW hybrid conv stem (3D CNN inside each 8 mm patch, zero-init projection, width
-  16) + CONTRAST-AWARE synthetic lesion suite (NEW: per-image MRI sequence from metadata
+  8) + CONTRAST-AWARE synthetic lesion suite (NEW: per-image MRI sequence from metadata
   sets each lesion''s signed signal: tumour rim bright on T1c / dark on T1w, infarct
   bright on DWI / dark on ADC, foci bright on FLAIR/T2; FLAIR/T2-bright peritumoral
   edema halo in the whole-lesion label; second lesion-head channel for the T1c enhancing
   part, like BraTS ET/WT): tumours (ring/diffuse/nodule; generators ported from mihirneal
   r24_syn, prob 0.5) + NEW stroke-like infarcts (prob 0.3) with a dense lesion head
   (w 0.5) and a NEW global lesion presence/burden head on the pooled embedding (w
-  0.1) + NEW context level head (24/40 mm, w 0.25) + NEW local anomaly head (w 0.5)
-  + decoder depth 6 + full-context cooldown (visible 1280, last 10%) + eval-matched
-  filelist L7 in this repo (leaked OpenBHB datasets removed) + Ryan ms-speed (cuda
-  graphs, batched level loss) + spacing-bucketed batches (rtd_ratio 0.107 keeps the
-  RTD swap count). Trained off-H100 (Colab A100), step keyed, steps matched to the
-  H100 hour from measured A100 cost ratios with a margin; h100_time_limit 59.5 caps
-  any H100 rerun.'
+  0.1) + NEW context level head (24/40 mm, w 0.25) + decoder depth 6 + full-context
+  cooldown (visible 1280, last 10%) + eval-matched filelist L7 in this repo (leaked
+  OpenBHB datasets removed) + Ryan ms-speed (cuda graphs, batched level loss) + spacing-bucketed
+  batches (rtd_ratio 0.107 keeps the RTD swap count). Trained off-H100 (Colab A100),
+  step keyed, steps matched to the H100 hour from measured A100 cost ratios with a
+  margin; h100_time_limit 59.5 caps any H100 rerun.'
 output_dir: output
 train_filelist: src/nanobrain/config/L7_l4_t1wboost138.txt
 anneal_filelist: null
@@ -59,12 +58,12 @@ model_kwargs:
   ctx_windows:
   - 3
   - 5
-  anom_weight: 0.5
+  anom_weight: 0.0
   anom_k:
   - 1.5
   - 2.5
   anom_window: 5
-  conv_stem_width: 16
+  conv_stem_width: 8
   tumor_prob: 0.5
   lesion_mask_weight: 0.5
   stroke_prob: 0.3
