@@ -540,13 +540,18 @@ def train(
             if cool_progress >= 1.0 - cooldown_frac:
                 num_visible = int(ctx_cooldown["num_visible"])
                 if not cooldown_logged and args.cudagraphs:
-                    # new sequence length: drop the compiled graphs and their cuda graph memory pool before
-                    # capturing the longer ones, so only one pool is ever held (two do not fit in 80 GB)
+                    # new sequence length: drop the compiled cuda graphs and their memory pool and finish the run
+                    # without cuda graphs (same math): the 1280-token graphs do not fit in 80 GB next to the
+                    # varying spacing-group shapes. the transformer parts are recompiled in the default mode
                     torch.compiler.reset()
+                    m = model_without_ddp
+                    m.encode_tokens = torch.compile(type(m).encode_tokens.__get__(m))
+                    m.decode_features = torch.compile(type(m).decode_features.__get__(m))
+                    args.cudagraphs = False
                     gc.collect()
                     torch.cuda.empty_cache()
                     logger.info(
-                        f"ctx cooldown: cuda graphs reset, {torch.cuda.memory_reserved() / 2**30:.1f} GB reserved"
+                        f"ctx cooldown: cuda graphs off, {torch.cuda.memory_reserved() / 2**30:.1f} GB reserved"
                     )
                 if not cooldown_logged:
                     logger.info(f"ctx cooldown: num_visible {args.num_visible} -> {num_visible} at step {step}")
